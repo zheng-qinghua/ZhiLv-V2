@@ -13,7 +13,7 @@ from __future__ import annotations
 from langchain_core.messages import SystemMessage
 
 from app.agents import base
-from app.agents.budget import low_block
+from app.agents.budget import block_state
 from app.graph.state import ChatState
 from app.llm import build_chat_llm
 from app.rag.retrieve import format_for_prompt, retrieve
@@ -38,20 +38,19 @@ def chitchat_node(state: ChatState) -> dict:
             ctx = ""
 
     # 预算不足拦截:信息齐且给过预算时,按路线最低花费判断要不要提醒并按住确认
-    block = low_block(params, str(state.get("insisted_sig") or "")) if ready else None
-    min_budget = round(block["min_total"]) if block else None
+    st = block_state(params, str(state.get("insisted_sig") or "")) if ready else None
 
     role = (
         "你是一名贴心的中国旅行规划助手,正在和用户聊天收集行程需求。语气自然友好,回复简洁"
         "(通常不超过 120 字)。若还有关键信息(出发地/目的地/时间)没问全,结尾自然问一句,别用列表盘问。"
     )
-    if block:
+    if st:
         role += (
             "注意:用户给出的预算(总额约 {} 元)明显低于这条路线的预估最低花费(约 {} 元,"
             "含往返大交通、按最省方式估)。请在回复里自然点明:按这预算正常排期走不下来,"
             "建议把预算至少加到 {} 元以上再生成;若预算实在有限,可以让他说「就按最省的吧」,"
             "你会按最省方式压缩排期。一两句带过即可,别列清单。".format(
-                round(block["budget_total"]), min_budget, min_budget
+                st["budget_total"], st["min_total"], st["min_budget"]
             )
         )
     need = base.param_status_text(params)
@@ -72,16 +71,16 @@ def chitchat_node(state: ChatState) -> dict:
         return {"reply": reply, "status": "failed", "ready": ready, "agent_trace": trace}
 
     messages = base.with_reply(state, reply)
-    if block:
+    if st:
         # 信息其实齐了,但预算过低:确认按钮按灰(ready=false),回复里已提示加预算/接受压缩
         return {
             "reply": reply,
-            "status": "budget_low",
-            "ready": False,
+            "status": st["status"],
+            "ready": st["ready"],
             "messages": messages,
             "params": params,
             "low_budget": True,
-            "min_budget": min_budget,
+            "min_budget": st["min_budget"],
             "agent_trace": trace,
         }
     return {
