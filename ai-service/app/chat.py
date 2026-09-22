@@ -1,10 +1,13 @@
-"""对话式规划(M3):LangGraph 状态图 + Redis 原生 JSON 持久化 + 简单 RAG。
+"""对话式规划的对外入口:Redis 状态存取 + handle_turn + 确认生成。
 
 每轮(thread 粒度,backend 用会话 id 当 thread):
-  抽取参数(DeepSeek,只认用户明说过的)→ 按"目的地/时间是否齐"和 RAG 参考生成中文回复。
+  载入状态 → 跑 LangGraph 图(见 app/graph/builder.py,supervisor 先判意图再分发专家)
+  → 写回状态。
 图本身不挂 checkpointer:状态由 handle_turn 从 Redis 载入、跑完再写回(native JSON,
 Windows Redis 无 RediSearch,不用 langgraph-checkpoint-redis)。
 降级:Redis 挂了退进程内内存态;RAG(Milvus/嵌入)挂了退纯对话,均不让对话断掉。
+
+confirm 路径(前端「确认行程」按钮)不进图:它是一次性生成动作,走 _generate_from_params。
 """
 from __future__ import annotations
 
@@ -12,22 +15,12 @@ import json
 from datetime import date, timedelta
 
 import redis as redis_lib
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langgraph.graph import END, START, StateGraph
 
 from app.agents.budget import low_block
-from app.agents.supervisor import supervisor_node
 from app.config import REDIS_HOST, REDIS_PORT
-from app.graph.params import (
-    PARAM_FIELDS,
-    is_ready,
-    missing_params,
-    to_date,
-    to_float,
-    to_int,
-)
-from app.graph.state import ChatState
-from app.llm import build_chat_llm, generate_trip_plan
+from app.graph.builder import GRAPH
+from app.graph.params import is_ready, missing_params, to_date, to_float, to_int
+from app.llm import generate_trip_plan
 from app.models import TripRequest
 from app.rag.retrieve import format_for_prompt, format_guide_by_city, retrieve
 
@@ -61,106 +54,6 @@ def _save_state(thread_id: str, state: dict) -> None:
     except Exception:
         pass
     _MEM[thread_id] = state
-
-
-# ---------------- LangGraph 节点 ----------------
-# 参数抽取(= supervisor 的一半职责)已迁到 app/agents/supervisor.py。
-
-
-def _respond_node(state: ChatState) -> dict:
-    llm = build_chat_llm()
-    params = state.get("params") or {}
-    ready = is_ready(params)
-    if llm is None:
-        return {"reply": "当前未配置 LLM_API_KEY,无法回答。请在 ai-service/.env 填好密钥后再试。",
-                "status": "failed", "ready": ready}
-
-    dest = params.get("destination")
-    ctx = ""
-    if dest:
-        try:
-            ctx = format_for_prompt(retrieve(state.get("new_message") or f"{dest} 旅游攻略"))
-        except Exception:
-            ctx = ""
-
-    missing = missing_params(params)
-
-    # 预算不足拦截:信息齐且给过预算时,按路线最低花费判断要不要提醒并按住确认
-    block = low_block(params, str(state.get("insisted_sig") or "")) if ready else None
-    low_budget = bool(block)
-    min_budget = round(block["min_total"]) if block else None
-
-    param_line = "、".join(f"{k}={params[k]}" for k in PARAM_FIELDS if params.get(k) is not None) or "尚无"
-    role = (
-        "你是一名贴心的中国旅行规划助手,正在和用户聊天收集行程需求。语气自然友好,回复简洁"
-        "(通常不超过 120 字)。若还有关键信息(出发地/目的地/时间)没问全,结尾自然问一句,别用列表盘问。"
-    )
-    if block:
-        role += (
-            "注意:用户给出的预算(总额约 {} 元)明显低于这条路线的预估最低花费(约 {} 元,"
-            "含往返大交通、按最省方式估)。请在回复里自然点明:按这预算正常排期走不下来,"
-            "建议把预算至少加到 {} 元以上再生成;若预算实在有限,可以让他说「就按最省的吧」,"
-            "你会按最省方式压缩排期。一两句带过即可,别列清单。".format(
-                round(block["budget_total"]), min_budget, min_budget
-            )
-        )
-    need = f"\n\n已确定:{param_line}\n未确定:{'、'.join(missing) if missing else '无'}"
-    if ctx:
-        sys = role + (
-            "下面是该目的地指南片段,可作推荐依据,只挑相关的说,别逐条罗列,别谎称来源。"
-        ) + need + f"\n〔参考指南〕\n{ctx}"
-    else:
-        sys = role + "没有可用指南,凭常识作答,别谎称来源。" + need
-    history = [SystemMessage(content=sys)]
-    for m in (state["messages"])[-20:]:  # 只喂最近 20 条,防对话过长
-        c = m.get("content", "")
-        if m.get("role") == "user":
-            history.append(HumanMessage(content=c))
-        else:
-            history.append(AIMessage(content=c))
-    try:
-        resp = llm.invoke(history)
-        reply = str(getattr(resp, "content", "")).strip()
-    except Exception as exc:
-        status = "failed"
-        reply = "回复生成超时/失败,请换个更短的说法再试。" if "Timeout" in type(exc).__name__ else \
-            f"回复生成失败:{type(exc).__name__}:{exc}"
-        return {"reply": reply, "status": status, "ready": ready}
-
-    messages = list(state["messages"])
-    messages.append({"role": "assistant", "content": reply})
-    if block:
-        # 信息其实齐了,但预算过低:确认按钮按灰(ready=false),回复里已提示加预算/接受压缩
-        return {
-            "reply": reply,
-            "status": "budget_low",
-            "ready": False,
-            "messages": messages,
-            "params": params,
-            "low_budget": True,
-            "min_budget": min_budget,
-        }
-    return {
-        "reply": reply,
-        "status": "await_confirm" if ready else "collecting",
-        "ready": ready,
-        "messages": messages,
-    }
-
-
-def _build_graph():
-    # Step 2a:只把参数抽取换成 supervisor(合并了意图路由),图结构与路由都不变 ——
-    # 先单独验证分类准不准,确认没有回归后再由 graph/builder.py 接管路由(Step 2b)。
-    g = StateGraph(ChatState)
-    g.add_node("supervisor", supervisor_node)
-    g.add_node("respond", _respond_node)
-    g.add_edge(START, "supervisor")
-    g.add_edge("supervisor", "respond")
-    g.add_edge("respond", END)
-    return g.compile()
-
-
-_GRAPH = _build_graph()
 
 
 # ---------------- M4:确认生成 ----------------
@@ -293,7 +186,7 @@ def handle_turn(thread_id: str, message: str = "", action: str = "chat") -> dict
     state["messages"] = list(state["messages"])
     state["messages"].append({"role": "user", "content": text})
     state["new_message"] = text
-    out = _GRAPH.invoke(state)
+    out = GRAPH.invoke(state)
 
     final_messages = out.get("messages") or state["messages"]
     final_params = out.get("params") or state["params"] or {}
@@ -306,8 +199,10 @@ def handle_turn(thread_id: str, message: str = "", action: str = "chat") -> dict
         "status": out.get("status", "collecting"),
         "ready": out.get("ready", False),
         "params": final_params or None,
-        # 本轮 supervisor 判出的意图。Step 2 阶段只观察不路由;Java 侧按名取字段,多余字段无影响
+        # 本轮 supervisor 判出的意图 + 走过的专家。前端暂未使用,给 probe 脚本与排查用;
+        # Java 按名取字段,多余的字段不影响解析
         "intent": out.get("intent"),
+        "agent_trace": out.get("agent_trace"),
     }
     if out.get("low_budget"):
         result["low_budget"] = True

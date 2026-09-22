@@ -112,7 +112,8 @@ def _apply_guards(intent: str, params: dict, state: ChatState) -> str:
 
 def supervisor_node(state: ChatState) -> dict:
     params = dict(state.get("params") or {})
-    out: dict = {"params": params, "intent": "collect"}
+    trace = list(state.get("agent_trace") or []) + ["supervisor"]
+    out: dict = {"params": params, "intent": "collect", "agent_trace": trace}
 
     llm = build_chat_llm()
     if llm is None:
@@ -132,7 +133,7 @@ def supervisor_node(state: ChatState) -> dict:
 
     params = _merge_params(params, obj)
     intent = _apply_guards(str(obj.get("intent") or "").strip().lower(), params, state)
-    out = {"params": params, "intent": intent}
+    out = {"params": params, "intent": intent, "agent_trace": trace}
 
     # 用户接受"预算低也按最省"→ 记住当前路由签名,同路由不再拦截(路由变了要重新拦)
     insist = obj.get("insist_low_budget")
