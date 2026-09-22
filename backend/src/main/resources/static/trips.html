@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智旅云图 · 行程管理</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; background: #f1f5f9; }
+  header {
+    background: linear-gradient(135deg, #1d4ed8, #0ea5e9); color: #fff;
+    padding: 14px 24px; display: flex; align-items: center; justify-content: space-between;
+  }
+  header .logo { font-size: 18px; font-weight: 600; }
+  header .right a, header .right button {
+    color: #fff; background: rgba(255,255,255,.18); border: none; cursor: pointer;
+    padding: 6px 12px; border-radius: 6px; font-size: 13px; text-decoration: none; margin-left: 8px;
+  }
+  header .right a:hover, header .right button:hover { background: rgba(255,255,255,.3); }
+  #auth-required {
+    display: none; max-width: 640px; margin: 60px auto; background: #fff;
+    padding: 30px; border-radius: 12px; text-align: center; color: #b91c1c;
+  }
+  #auth-required a { color: #1d4ed8; font-weight: 600; }
+  main { max-width: 1000px; margin: 20px auto; display: none; gap: 18px; padding: 0 16px; }
+  .col { background: #fff; border-radius: 12px; padding: 20px; }
+  .col h2 { font-size: 16px; margin-bottom: 14px; color: #1e293b; }
+  label { display: block; font-size: 13px; color: #475569; margin: 10px 0 4px; }
+  input, select, textarea {
+    width: 100%; padding: 8px 10px; font-size: 14px; border: 1px solid #cbd5e1;
+    border-radius: 8px; outline: none;
+  }
+  input:focus, select:focus, textarea:focus { border-color: #1d4ed8; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  .btn {
+    width: 100%; margin-top: 16px; padding: 10px 0; background: #1d4ed8; color: #fff;
+    border: none; border-radius: 8px; font-size: 15px; cursor: pointer;
+  }
+  .btn:hover { background: #1e40af; }
+  .msg { margin-top: 10px; padding: 8px 10px; border-radius: 8px; font-size: 13px; display: none; }
+  .msg.ok { display: block; background: #ecfdf5; color: #047857; }
+  .msg.err { display: block; background: #fef2f2; color: #b91c1c; }
+  .bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .bar .count { font-size: 13px; color: #64748b; }
+  .trip {
+    border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 14px; margin-bottom: 10px;
+  }
+  .trip .top { display: flex; justify-content: space-between; align-items: center; }
+  .trip .title { font-size: 15px; font-weight: 600; color: #1e293b; }
+  .trip .tag {
+    font-size: 11px; padding: 2px 8px; border-radius: 99px; margin-left: 8px;
+    background: #dbeafe; color: #1d4ed8;
+  }
+  .trip .tag.chat { background: #f3e8ff; color: #7c3aed; }
+  .trip .meta { margin-top: 6px; font-size: 13px; color: #64748b; }
+  .trip .meta b { color: #334155; }
+  .trip .ops { margin-top: 8px; display: flex; gap: 8px; }
+  .trip .ops button {
+    border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; cursor: pointer;
+    padding: 4px 12px; border-radius: 6px; font-size: 12px;
+  }
+  .trip .ops button.del { border-color: #fecaca; color: #b91c1c; }
+  .trip .ops button:hover { background: #eef2ff; }
+  .pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 14px; }
+  .pager button {
+    border: 1px solid #cbd5e1; background: #fff; cursor: pointer; padding: 6px 16px;
+    border-radius: 8px; font-size: 13px;
+  }
+  .pager button:disabled { opacity: .4; cursor: not-allowed; }
+  .pager span { font-size: 13px; color: #64748b; }
+  pre {
+    background: #0f172a; color: #7dd3fc; border-radius: 10px; padding: 14px; font-size: 12px;
+    max-height: 340px; overflow: auto; margin-top: 12px; white-space: pre-wrap; word-break: break-all;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="logo">智旅云图 · 行程管理</div>
+    <div class="right">
+      <span id="who" style="font-size:13px;opacity:.9"></span>
+      <a href="/login.html">返回登录页</a>
+      <button onclick="logout()">退出登录</button>
+    </div>
+  </header>
+
+  <div id="auth-required">
+    尚未登录。<a href="/login.html">先到登录页登录</a>,拿到 token 后再回来。
+  </div>
+
+  <main id="main">
+    <div style="display:flex;gap:18px;flex-wrap:wrap">
+      <div class="col" style="flex:1;min-width:320px">
+        <h2>新建行程(表单提交)</h2>
+        <form id="trip-form" onsubmit="return submitTrip(event)">
+          <label>标题(留空自动生成)</label>
+          <input id="f-title" placeholder="如:杭州三日游">
+          <label>目的地 *</label>
+          <input id="f-dest" required placeholder="如:杭州">
+          <div class="row">
+            <div>
+              <label>开始日期 *</label>
+              <input id="f-start" type="date" required>
+            </div>
+            <div>
+              <label>结束日期 *</label>
+              <input id="f-end" type="date" required>
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label>出行人数 *</label>
+              <input id="f-travelers" type="number" min="1" value="2" required>
+            </div>
+            <div>
+              <label>预算(元)*</label>
+              <input id="f-budget" type="number" min="1" value="3000" required>
+            </div>
+          </div>
+          <label>偏好(逗号分隔)</label>
+          <input id="f-pref" placeholder="如:美食,文化">
+          <label>节奏</label>
+          <select id="f-pace">
+            <option value="">不指定</option>
+            <option>轻松</option>
+            <option>适中</option>
+            <option>紧凑</option>
+          </select>
+          <label>备注</label>
+          <input id="f-notes" placeholder="如:想看日落">
+          <button class="btn" id="submit-btn">提交创建</button>
+          <div class="msg" id="form-msg"></div>
+        </form>
+      </div>
+
+      <div class="col" style="flex:1.3;min-width:380px">
+        <div class="bar">
+          <h2 style="margin:0">我的行程历史</h2>
+          <span class="count" id="list-count"></span>
+        </div>
+        <div id="trip-list"></div>
+        <div class="pager">
+          <button id="prev-btn" onclick="go(-1)">上一页</button>
+          <span id="page-info"></span>
+          <button id="next-btn" onclick="go(1)">下一页</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="col" id="ai-col" style="margin-top:18px">
+      <h2>AI 生成预览(直接调 ai-service /generate)</h2>
+      <div class="row">
+        <div><label>目的地 *</label><input id="ai-dest" placeholder="如:西安"></div>
+        <div><label>开始日期 *</label><input id="ai-start" type="date"></div>
+        <div><label>结束日期 *</label><input id="ai-end" type="date"></div>
+      </div>
+      <div class="row">
+        <div><label>人数</label><input id="ai-travelers" type="number" min="1" value="2"></div>
+        <div><label>预算(元)</label><input id="ai-budget" type="number" min="1" value="3000"></div>
+        <div><label>偏好(逗号分隔)</label><input id="ai-pref" placeholder="如:美食,历史"></div>
+      </div>
+      <div class="row">
+        <div><label>节奏</label>
+          <select id="ai-pace">
+            <option>轻松</option>
+            <option selected>适中</option>
+            <option>紧凑</option>
+          </select>
+        </div>
+        <div style="flex:2"><label>备注</label><input id="ai-notes" placeholder="如:想看日落"></div>
+      </div>
+      <button class="btn" id="ai-btn" onclick="aiTest()">AI 生成预览(约10~60秒)</button>
+      <div class="msg" id="ai-msg"></div>
+      <pre id="ai-view" style="display:none"></pre>
+    </div>
+
+    <div class="col" id="export-col" style="margin-top:18px;display:none">
+      <h2 id="export-title">导出内容</h2>
+      <pre id="export-view"></pre>
+    </div>
+  </main>
+
+<script>
+var TOKEN = localStorage.getItem('zhilv_token') || '';
+var USER = localStorage.getItem('zhilv_user') || '';
+var page = 0;
+var totalPages = 1;
+
+if (TOKEN) {
+  document.getElementById('who').textContent = USER ? ('你好,' + USER + '  ') : '';
+  document.getElementById('main').style.display = 'block';
+  loadList();
+} else {
+  document.getElementById('auth-required').style.display = 'block';
+}
+
+function esc(s) {
+  return s == null ? '' : String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function logout() {
+  localStorage.removeItem('zhilv_token');
+  localStorage.removeItem('zhilv_user');
+  location.href = '/login.html';
+}
+
+function showMsg(id, type, text) {
+  var el = document.getElementById(id);
+  el.className = 'msg ' + type;
+  el.textContent = text;
+}
+
+async function submitTrip(ev) {
+  ev.preventDefault();
+  var prefs = document.getElementById('f-pref').value.split(/[,，、\s]+/).filter(Boolean);
+  var body = {
+    title: document.getElementById('f-title').value.trim() || null,
+    destination: document.getElementById('f-dest').value.trim(),
+    start_date: document.getElementById('f-start').value,
+    end_date: document.getElementById('f-end').value,
+    travelers: parseInt(document.getElementById('f-travelers').value, 10),
+    budget: parseFloat(document.getElementById('f-budget').value),
+    preferences: prefs,
+    pace: document.getElementById('f-pace').value || null,
+    special_notes: document.getElementById('f-notes').value.trim() || null
+  };
+  var btn = document.getElementById('submit-btn');
+  btn.disabled = true;
+  var btnOld = btn.textContent;
+  btn.textContent = 'AI 生成中(约10~60秒)…';
+  try {
+    var resp = await fetch('/api/trips', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN },
+      body: JSON.stringify(body)
+    });
+    var data = await resp.json();
+    if (data.code === 200) {
+      showMsg('form-msg', 'ok', '创建成功!AI 已生成完整行程,可在下方列表点「导出 JSON」查看每日安排');
+      document.getElementById('trip-form').reset();
+      page = 0;
+      loadList();
+    } else {
+      showMsg('form-msg', 'err', data.message || '创建失败');
+    }
+  } catch (e) {
+    showMsg('form-msg', 'err', '网络错误,请确认后端已启动、ai-service(8100)在跑');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = btnOld;
+  }
+  return false;
+}
+
+async function loadList() {
+  var holder = document.getElementById('trip-list');
+  holder.innerHTML = '<div style="color:#94a3b8;padding:10px 0">加载中…</div>';
+  try {
+    var resp = await fetch('/api/trips?page=' + page + '&size=5', {
+      headers: { 'Authorization': 'Bearer ' + TOKEN }
+    });
+    var data = await resp.json();
+    if (data.code !== 200) throw new Error(data.message);
+    var d = data.data;
+    totalPages = d.totalPages || 1;
+    document.getElementById('list-count').textContent = '共 ' + d.totalElements + ' 条';
+    document.getElementById('page-info').textContent = '第 ' + (d.number + 1) + '/' + totalPages + ' 页';
+    document.getElementById('prev-btn').disabled = d.first;
+    document.getElementById('next-btn').disabled = d.last;
+    if (!d.content || d.content.length === 0) {
+      holder.innerHTML = '<div style="color:#94a3b8;padding:10px 0">还没有行程,先用左边表单创建一条</div>';
+      return;
+    }
+    var html = '';
+    d.content.forEach(function (t) {
+      var tag = t.source === 'CHAT' ? '<span class="tag chat">CHAT</span>' : '<span class="tag">FORM</span>';
+      html += '<div class="trip">' +
+        '<div class="top"><span class="title">' + esc(t.title) + ' · ' + esc(t.destination) + '</span>' + tag + '</div>' +
+        '<div class="meta">' + (t.startDate ? esc(t.startDate) : '?') + ' ~ ' + (t.endDate ? esc(t.endDate) : '?') +
+        ' · ' + (t.dayCount || 1) + '天 · ' + (t.travelers || 1) + '人 · 预算 ¥' + (t.budget != null ? t.budget : '-') + '</div>' +
+        '<div class="ops">' +
+        '<button onclick="doExport(' + t.id + ')">导出 JSON</button>' +
+        '<button class="del" onclick="doDelete(' + t.id + ')">删除</button>' +
+        '</div></div>';
+    });
+    holder.innerHTML = html;
+  } catch (e) {
+    holder.innerHTML = '<div style="color:#b91c1c;padding:10px 0">加载失败:' + esc(e.message) + '</div>';
+  }
+}
+
+function go(delta) {
+  var np = page + delta;
+  if (np < 0 || np >= totalPages) return;
+  page = np;
+  loadList();
+}
+
+async function doDelete(id) {
+  if (!window.confirm('确认删除该行程?')) return;
+  var resp = await fetch('/api/trips/' + id, {
+    method: 'DELETE',
+    headers: { 'Authorization': 'Bearer ' + TOKEN }
+  });
+  var data = await resp.json();
+  if (data.code === 200) {
+    page = 0;
+    loadList();
+    var ec = document.getElementById('export-col');
+    ec.style.display = 'none';
+  } else {
+    window.alert('删除失败:' + (data.message || '未知'));
+  }
+}
+
+async function doExport(id) {
+  try {
+    var resp = await fetch('/api/trips/' + id + '/export', {
+      headers: { 'Authorization': 'Bearer ' + TOKEN }
+    });
+    var data = await resp.json();
+    if (data.code !== 200) throw new Error(data.message || '导出失败');
+    document.getElementById('export-title').textContent = '导出内容(id=' + id + ', TripPlan JSON)';
+    document.getElementById('export-view').textContent = JSON.stringify(data.data, null, 2);
+    document.getElementById('export-col').style.display = 'block';
+  } catch (e) {
+    window.alert('导出失败:' + e.message);
+  }
+}
+
+async function aiTest() {
+  var msg = document.getElementById('ai-msg');
+  var view = document.getElementById('ai-view');
+  msg.className = 'msg';
+  var body = {
+    destination: document.getElementById('ai-dest').value.trim(),
+    start_date: document.getElementById('ai-start').value,
+    end_date: document.getElementById('ai-end').value,
+    travelers: parseInt(document.getElementById('ai-travelers').value, 10),
+    budget: parseFloat(document.getElementById('ai-budget').value),
+    preferences: document.getElementById('ai-pref').value.split(/[,，、\s]+/).filter(Boolean),
+    pace: document.getElementById('ai-pace').value,
+    special_notes: document.getElementById('ai-notes').value.trim() || null
+  };
+  if (!body.destination || !body.start_date || !body.end_date) {
+    msg.className = 'msg err';
+    msg.textContent = '目的地和开始/结束日期必填';
+    return;
+  }
+  var btn = document.getElementById('ai-btn');
+  btn.disabled = true;
+  view.style.display = 'none';
+  msg.className = 'msg ok';
+  msg.textContent = 'AI 正在生成(约10~60秒),请稍候…';
+  try {
+    var resp = await fetch('/api/ai/generate-test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN },
+      body: JSON.stringify(body)
+    });
+    var data = await resp.json();
+    if (data.code === 200) {
+      msg.className = 'msg ok';
+      msg.textContent = '生成成功,字段已对齐 TripPlan 契约。';
+      view.textContent = JSON.stringify(data.data, null, 2);
+      view.style.display = 'block';
+    } else {
+      msg.className = 'msg err';
+      msg.textContent = data.message || '生成失败';
+    }
+  } catch (e) {
+    msg.className = 'msg err';
+    msg.textContent = '网络错误:请确认后端(8080)与 ai-service(8100)都已启动';
+  } finally {
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>

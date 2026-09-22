@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智旅云图 · 登录 / 注册</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(135deg, #1d4ed8 0%, #0ea5e9 60%, #38bdf8 100%);
+  }
+  .card {
+    width: 400px;
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.25);
+    overflow: hidden;
+  }
+  .brand { padding: 24px 0 8px; text-align: center; }
+  .brand h1 { font-size: 22px; color: #1d4ed8; }
+  .brand p { font-size: 13px; color: #94a3b8; margin-top: 4px; }
+  .tabs { display: flex; margin: 18px 32px 0; border-bottom: 1px solid #e2e8f0; }
+  .tab {
+    flex: 1; text-align: center; padding: 10px 0; cursor: pointer;
+    color: #64748b; font-size: 15px; border-bottom: 2px solid transparent;
+    user-select: none;
+  }
+  .tab.active { color: #1d4ed8; border-bottom-color: #1d4ed8; font-weight: 600; }
+  .form { padding: 24px 32px 28px; display: none; }
+  .form.active { display: block; }
+  .form label { display: block; font-size: 13px; color: #475569; margin: 14px 0 6px; }
+  .form input {
+    width: 100%; padding: 10px 12px; font-size: 14px;
+    border: 1px solid #cbd5e1; border-radius: 8px; outline: none;
+    transition: border-color .15s;
+  }
+  .form input:focus { border-color: #1d4ed8; }
+  .btn {
+    width: 100%; margin-top: 20px; padding: 11px 0;
+    background: #1d4ed8; color: #fff; border: none; border-radius: 8px;
+    font-size: 15px; cursor: pointer; transition: background .15s;
+  }
+  .btn:hover { background: #1e40af; }
+  .btn:disabled { background: #93c5fd; cursor: not-allowed; }
+  .msg {
+    margin-top: 14px; padding: 10px 12px; border-radius: 8px;
+    font-size: 13px; line-height: 1.5; word-break: break-all;
+    display: none;
+  }
+  .msg.ok { display: block; background: #ecfdf5; color: #047857; }
+  .msg.err { display: block; background: #fef2f2; color: #b91c1c; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">
+      <h1>智旅云图</h1>
+      <p>你的智能旅行规划助手</p>
+    </div>
+
+    <div class="tabs">
+      <div class="tab active" data-tab="login" onclick="switchTab('login')">登录</div>
+      <div class="tab" data-tab="register" onclick="switchTab('register')">注册</div>
+    </div>
+
+    <!-- 登录 -->
+    <div class="form active" id="form-login">
+      <label>用户名</label>
+      <input id="login-username" autocomplete="username" placeholder="请输入用户名">
+      <label>密码</label>
+      <input id="login-password" type="password" autocomplete="current-password" placeholder="请输入密码">
+      <button class="btn" id="login-btn" onclick="doLogin()">登 录</button>
+      <div class="msg" id="login-msg"></div>
+    </div>
+
+    <!-- 注册 -->
+    <div class="form" id="form-register">
+      <label>用户名</label>
+      <input id="reg-username" autocomplete="username" placeholder="请输入用户名">
+      <label>密码</label>
+      <input id="reg-password" type="password" autocomplete="new-password" placeholder="请输入密码">
+      <label>确认密码</label>
+      <input id="reg-password2" type="password" autocomplete="new-password" placeholder="再输入一次密码">
+      <button class="btn" id="reg-btn" onclick="doRegister()">注 册</button>
+      <div class="msg" id="reg-msg"></div>
+    </div>
+  </div>
+
+<script>
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.getElementById('form-login').classList.toggle('active', name === 'login');
+  document.getElementById('form-register').classList.toggle('active', name === 'register');
+}
+
+function showMsg(id, type, text) {
+  const el = document.getElementById(id);
+  el.className = 'msg ' + type;
+  el.textContent = text;
+}
+
+async function post(url, body) {
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return resp.json();
+}
+
+function setBusy(btn, on) {
+  btn.disabled = on;
+  btn.textContent = on ? '请稍候…' : (btn.id.includes('reg') ? '注 册' : '登 录');
+}
+
+async function doLogin() {
+  const btn = document.getElementById('login-btn');
+  const u = document.getElementById('login-username').value.trim();
+  const p = document.getElementById('login-password').value;
+  showMsg('login-msg', 'err', '');
+  if (!u || !p) return showMsg('login-msg', 'err', '用户名和密码不能为空');
+  setBusy(btn, true);
+  try {
+    const data = await post('/api/auth/login', { username: u, password: p });
+    if (data.code === 200) {
+      localStorage.setItem('zhilv_token', data.data.token);
+      localStorage.setItem('zhilv_user', data.data.username);
+      showMsg('login-msg', 'ok', '登录成功,正在进入行程管理页…');
+      setTimeout(() => { location.href = '/trips.html'; }, 600);
+    } else {
+      showMsg('login-msg', 'err', data.message);
+    }
+  } catch (e) {
+    showMsg('login-msg', 'err', '网络错误,请确认后端已启动');
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+async function doRegister() {
+  const btn = document.getElementById('reg-btn');
+  const u = document.getElementById('reg-username').value.trim();
+  const p = document.getElementById('reg-password').value;
+  const p2 = document.getElementById('reg-password2').value;
+  showMsg('reg-msg', 'err', '');
+  if (!u || !p) return showMsg('reg-msg', 'err', '用户名和密码不能为空');
+  if (p !== p2) return showMsg('reg-msg', 'err', '两次输入的密码不一致');
+  if (p.length < 6) return showMsg('reg-msg', 'err', '密码至少 6 位');
+  setBusy(btn, true);
+  try {
+    const data = await post('/api/auth/register', { username: u, password: p });
+    if (data.code === 200) {
+      showMsg('reg-msg', 'ok', '注册成功!请切换到"登录"页签登录');
+      document.getElementById('reg-username').value = '';
+      document.getElementById('reg-password').value = '';
+      document.getElementById('reg-password2').value = '';
+    } else {
+      showMsg('reg-msg', 'err', data.message);
+    }
+  } catch (e) {
+    showMsg('reg-msg', 'err', '网络错误,请确认后端已启动');
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+</script>
+</body>
+</html>
