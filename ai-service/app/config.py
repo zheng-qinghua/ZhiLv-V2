@@ -51,3 +51,5 @@ if not RAG_DATA_DIR.is_absolute():
     RAG_DATA_DIR = BASE_DIR / RAG_DATA_DIR
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))  # bge-m3 固定 1024
+# Milvus 不可用时每次召回要等 pymilvus 重试约 10 秒才降级;连续失败后短路这么久再试一次
+RAG_BREAKER_TTL_SECONDS = float(os.getenv("RAG_BREAKER_TTL_SECONDS", "60"))

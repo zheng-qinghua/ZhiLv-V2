@@ -11,7 +11,9 @@
 | Step 1 骨架与状态拆分 | ✅ 已完成 (2026-09-22) | 新建 `graph/state.py`、`graph/params.py`;`chat.py` 改为引用。冒烟测试与改造前行为一致 |
 | Step 2a Supervisor 节点 | ✅ 已完成 (2026-09-22) | `agents/supervisor.py`(7 类 intent 合并抽取)+ `agents/budget.py` + `scripts/probe_chat.py`。**话术集分类命中 15/15** |
 | Step 2b 换图 | ✅ 已完成 (2026-09-22) | `agents/chitchat.py` + `graph/builder.py`(路由表)。闲聊/参数齐两条路径与改造前逐项一致 |
-| Step 3 ~ Step 9 | ⬜ 未开始 | |
+| Step 3a RAG 工具化 | ✅ 已完成 (2026-09-22) | `tools/rag_tool.py` 两个工具 + `rag/retrieve.py` 熔断。Milvus 挂时 11.04s → 0.00s |
+| Step 3b Retriever 专家 | ✅ 已完成 (2026-09-22) | `agents/retriever.py`(function calling 循环)+ `agents/base.py`(第二个消费者出现,公共件才抽)+ 接上 `guide` 分支。**话术集 15/15,攻略回复带真实资料** |
+| Step 4 ~ Step 9 | ⬜ 未开始 | |
 
 ### 实施中的偏离记录
 
@@ -21,7 +23,9 @@
 
 ### 已发现的既有问题(非本次改造引入,待处理)
 
-- **Milvus 不可用时 `rag/retrieve.py:retrieve()` 空转 10.9 秒**(pymilvus 重试)才降级返回空;而 `format_guide_by_city()` 走 MySQL 只需 0.2s 且能拿到真数据。结果每轮对话白等约 10 秒。**Step 3 把检索包成工具时必须一并处理**(加"不可用"短期缓存,别每轮重试)。
+- ~~**Milvus 不可用时 `rag/retrieve.py:retrieve()` 空转 10.9 秒**~~ → **Step 3a 已修**(`_BREAKER` 熔断,`RAG_BREAKER_TTL_SECONDS` 默认 60s)。注意 TTL 到期后会再真试一次,所以 Milvus 长期挂掉时,每 60 秒仍会有一轮多等 11 秒;这是刻意的(不通就恢复),不是回归。
+- **Redis 挂掉时每轮对话白等约 95 秒**(未处理,优先级高):`chat.py:_load_state`/`_save_state` 每次新建连接,`socket_connect_timeout=2` 只约束建立连接,不约束 redis-py 的重试退避。实测 Redis 停机时 load 47.1s + save 48.4s = 每轮 ~95s,而 LLM 本身只要 1s。这与上面 Milvus 那条同源(依赖不可用时慢重试),同一套熔断/短路思路可解:加 socket_timeout、或连续失败后进"不可用"窗口直接走 `_MEM`。**不属 Step 3 范围,单独排期。**
+- **验证环境提示**:probe 的耗时读数只有在 Redis、Milvus 都起来时才有意义;否则量到的是重试退避而不是业务耗时。
 
 ---
 
@@ -153,11 +157,22 @@ ai-service/app/
 - 验证:`probe_chat.py` 说「你好」→ `intent=chitchat`;说「从北京去大理玩5天」→ `status=await_confirm`;点 confirm → `status=generated`。**与改造前行为完全一致**
 - 说明:此步是「换个壳」,风险最高的一段改动集中在这里,做完先停一次,确认无回归再往下
 
-### Step 3 · Retriever 专家(RAG 工具化)
+### Step 3 · Retriever 专家(RAG 工具化)✅ 已拆成 3a / 3b 完成
 - 新建 `app/tools/rag_tool.py`:把 `rag/retrieve.py` 的 `retrieve` 包成 `@tool`
 - 新建 `app/agents/retriever.py`:调工具取攻略 → 组织回复
 - 改 `app/graph/builder.py`:接上 `guide` 分支
 - 验证:说「大理有什么好吃的」→ 回复里出现指南里的真实店名/菜品,且 `probe` 打印 `intent=guide`
+
+**3a 实际做法(比原计划多的两处)**:
+- **做成两个工具而不是一个**:`search_guide`(Milvus 语义检索,答具体问题)+ `get_city_guide`(MySQL 整篇城市指南,答宽泛问题)。实测 MySQL 是通的、`format_guide_by_city` 0.12s 就能拿到 768 字真指南,所以 Milvus 挂着时 retriever 依然答得出东西 —— 两个工具互为兜底,不是重复。
+- **`search_guide` 里加了熔断**(原计划只写"包成 @tool"):`_BREAKER` + `RAG_BREAKER_TTL_SECONDS`。实测 Milvus 挂时第一次 11.04s、第二次起 0.00s。
+- 工具自己吞异常返回「（没有检索到相关资料）」而不是抛错 —— 模型据此换 `get_city_guide` 再试,链路不断。
+
+**3b 实际做法**:
+- 建 `app/agents/base.py`:抽 `trace` / `param_status_text` / `ready_status` / `history_messages` / `with_reply`。**此时才有第二个消费者(chitchat + retriever),符合"出现重复再抽"的约定**(Step 2b 时故意没抽)。
+- `agents/chitchat.py` 改为复用 `base.*`,自身只留 chitchat 专属 prompt 与预算拦截分支。
+- **没做的一件事**:`retriever` 没有复用 `base.history_messages`,而是自己拼 SystemMessage + `base.history_messages`;这是同一份实现,没有分叉。
+- 验证结果:`guide` 两问均 `trace: supervisor→retriever` 且回复带真实菜品(酸辣鱼/乳扇/砂锅米线/喜洲粑粑/凉鸡米线),并主动声明"哪家店、价格、营业时间没有可靠资料就不瞎推荐";话术集 **15/15**;闲聊、参数齐、预算过低拦截(含「就按最省的吧」→ `await_confirm`)三条路径均无回归。
 
 ### Step 4 · Budget 专家(预算独立成节点)
 - 新建 `app/agents/budget.py`:`_estimate_min_total` / `_low_block` 从 `chat.py` 迁入,保持缓存与口径不变
