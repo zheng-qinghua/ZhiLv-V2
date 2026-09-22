@@ -9,8 +9,19 @@
 | 步骤 | 状态 | 说明 |
 |---|---|---|
 | Step 1 骨架与状态拆分 | ✅ 已完成 (2026-09-22) | 新建 `graph/state.py`、`graph/params.py`;`chat.py` 改为引用。冒烟测试与改造前行为一致 |
-| Step 2 Supervisor 路由 + 闲聊分支 | ⬜ 未开始 | **风险最高的一步,做完先验收** |
+| Step 2a Supervisor 节点 | ✅ 已完成 (2026-09-22) | `agents/supervisor.py`(7 类 intent 合并抽取)+ `agents/budget.py` + `scripts/probe_chat.py`。**话术集分类命中 15/15** |
+| Step 2b 换图 | ✅ 已完成 (2026-09-22) | `agents/chitchat.py` + `graph/builder.py`(路由表)。闲聊/参数齐两条路径与改造前逐项一致 |
 | Step 3 ~ Step 9 | ⬜ 未开始 | |
+
+### 实施中的偏离记录
+
+- **Step 2 拆成 2a/2b**:先加 supervisor 节点但不改路由,用话术集单独验证分类质量,再换图。好处是分类回归失败时不必回滚图结构。
+- **不在 Step 2 建 `agents/base.py`**:当时只有一个回复型节点,抽公共 prompt 是过度设计;等 Step 3 有了 retriever 这第二个消费者再抽。
+- **`agents/budget.py` 提前到 Step 2a**:chitchat 要用 `low_block`,而 chitchat 被图引用,不能再反向 import 入口 `chat.py`,否则循环依赖。所以预算模块必须先独立;Step 4 只剩「接分支 + 做成独立节点」。
+
+### 已发现的既有问题(非本次改造引入,待处理)
+
+- **Milvus 不可用时 `rag/retrieve.py:retrieve()` 空转 10.9 秒**(pymilvus 重试)才降级返回空;而 `format_guide_by_city()` 走 MySQL 只需 0.2s 且能拿到真数据。结果每轮对话白等约 10 秒。**Step 3 把检索包成工具时必须一并处理**(加"不可用"短期缓存,别每轮重试)。
 
 ---
 

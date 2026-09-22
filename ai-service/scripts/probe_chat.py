@@ -67,8 +67,10 @@ def line(user_msg: str, out: dict, expect: str | None = None) -> bool:
     ok = expect is None or got == expect
     flag = "" if expect is None else ("  OK " if ok else f"  期望 {expect} ✗")
     reply = (out.get("reply") or "").replace("\n", " ")
+    trace = out.get("agent_trace") or []
     print(f"[{got or '?':8}] status={out.get('status'):14} ready={str(out.get('ready')):5} "
           f"| {user_msg} → {reply[:38]}{flag}")
+    print(f"           trace: {'→'.join(trace) or '-'}")
     print(f"           params: {_fmt_params(out.get('params'))}")
     return ok
 
