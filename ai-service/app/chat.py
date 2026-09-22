@@ -9,28 +9,25 @@ Windows Redis 无 RediSearch,不用 langgraph-checkpoint-redis)。
 from __future__ import annotations
 
 import json
-import time
 from datetime import date, timedelta
 
 import redis as redis_lib
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
+from app.agents.budget import low_block
+from app.agents.supervisor import supervisor_node
 from app.config import REDIS_HOST, REDIS_PORT
 from app.graph.params import (
     PARAM_FIELDS,
-    budget_total_of,
     is_ready,
     missing_params,
-    resolved_days,
-    resolved_travelers,
-    route_sig,
     to_date,
     to_float,
     to_int,
 )
 from app.graph.state import ChatState
-from app.llm import _extract_json_object, build_chat_llm, generate_trip_plan
+from app.llm import build_chat_llm, generate_trip_plan
 from app.models import TripRequest
 from app.rag.retrieve import format_for_prompt, format_guide_by_city, retrieve
 
@@ -67,71 +64,7 @@ def _save_state(thread_id: str, state: dict) -> None:
 
 
 # ---------------- LangGraph 节点 ----------------
-
-
-def _extract_node(state: ChatState) -> dict:
-    params = dict(state.get("params") or {})
-    llm = build_chat_llm()
-    if llm is None:
-        return {"params": params}
-    convo = "\n".join(
-        f"{'用户' if m.get('role') == 'user' else '助手'}: {m.get('content', '')}"
-        for m in state["messages"]
-    )
-    sys = (
-        "你是行程参数抽取器。读完整段对话,只挑【用户明确说过】的字段输出 JSON,"
-        "不要猜测、不要补默认值、不要解析尚未说清的信息。"
-    )
-    human = f"""当前已确定参数:{json.dumps(params, ensure_ascii=False)}
-对话全文:
-{convo}
-
-只输出一个 JSON 对象,字段取值下面这套(未提到/不确定/无变化的都填 null,绝不编造):
-- departure: 出发城市名(如 "北京");用户说"从X出发/从X去/家住X"才算,否则 null
-- destination: 目的地城市名(如 "大理")
-- start_date / end_date: "YYYY-MM-DD",仅用户给出具体日期才填
-- total_days: 整数,仅用户说"玩N天/N日"才填;已给具体起止日期就别填
-- travelers: 出行人数整数
-- budget: 金额数字——用户是总额口径就写总额;明确是"人均/每人"就写那个单价
-- budget_unit: "total" 或 "per_person"(与 budget 对应;没说金额则 null)
-- preferences: 字符串数组(如 ["慢节奏"]);无则 null
-- pace: 节奏(轻松/适中/紧凑)
-- hotel_level: 住宿档次(经济型/舒适型/高档型)
-- dietary_preferences: 饮食偏好数组(如 ["少辣"]);无则 null
-- special_notes: 其它特殊要求(如 "想看日出")字符串
-- insist_low_budget: 布尔。当且仅当用户本轮明确接受"预算不够也按最省/尽量压缩排期"继续(如"就按最省的安排吧""预算就这么点你看着办""越省越好"),才填 true;只是陈述自己预算低、或没表态,填 false
-
-注意:金额没说单位一律按总额 total;日期只认用户原话,别拿今天当默认;地点变了但用户没重说时间/人数等,就保留上文已确定的。直接给 JSON,不要 markdown,不要解释。"""
-    try:
-        resp = llm.invoke([("system", sys), ("human", human)])
-        frag = _extract_json_object(str(getattr(resp, "content", "")))
-        if frag:
-            obj = json.loads(frag)
-            for k in PARAM_FIELDS:
-                v = obj.get(k)
-                if v is None:
-                    continue
-                if isinstance(v, (list, tuple)):
-                    v = [str(x).strip() for x in v if str(x).strip()]
-                    if not v:
-                        continue
-                elif isinstance(v, str):
-                    v = v.strip()
-                    if not v:
-                        continue
-                params[k] = v
-            # 用户接受"预算低也按最省"→ 记住当前路由签名,同路由不再拦截(路由变了要重新拦)
-            insist = obj.get("insist_low_budget")
-            if insist is True or str(insist).strip().lower() in ("true", "yes", "1", "是", "对"):
-                dep = str(params.get("departure") or "").strip()
-                dest = str(params.get("destination") or "").strip()
-                dc = resolved_days(params)
-                if dep and dest and dc:
-                    return {"params": params,
-                            "insisted_sig": route_sig(dep, dest, dc, resolved_travelers(params))}
-    except Exception:
-        pass  # 抽取失败不打断对话:沿用旧参数继续
-    return {"params": params}
+# 参数抽取(= supervisor 的一半职责)已迁到 app/agents/supervisor.py。
 
 
 def _respond_node(state: ChatState) -> dict:
@@ -153,7 +86,7 @@ def _respond_node(state: ChatState) -> dict:
     missing = missing_params(params)
 
     # 预算不足拦截:信息齐且给过预算时,按路线最低花费判断要不要提醒并按住确认
-    block = _low_block(params, str(state.get("insisted_sig") or "")) if ready else None
+    block = low_block(params, str(state.get("insisted_sig") or "")) if ready else None
     low_budget = bool(block)
     min_budget = round(block["min_total"]) if block else None
 
@@ -216,11 +149,13 @@ def _respond_node(state: ChatState) -> dict:
 
 
 def _build_graph():
+    # Step 2a:只把参数抽取换成 supervisor(合并了意图路由),图结构与路由都不变 ——
+    # 先单独验证分类准不准,确认没有回归后再由 graph/builder.py 接管路由(Step 2b)。
     g = StateGraph(ChatState)
-    g.add_node("extract", _extract_node)
+    g.add_node("supervisor", supervisor_node)
     g.add_node("respond", _respond_node)
-    g.add_edge(START, "extract")
-    g.add_edge("extract", "respond")
+    g.add_edge(START, "supervisor")
+    g.add_edge("supervisor", "respond")
     g.add_edge("respond", END)
     return g.compile()
 
@@ -243,61 +178,6 @@ def _gen_rag_context(dest: str) -> str:
         return format_for_prompt(retrieve(f"{dest} 旅游攻略"))
     except Exception:
         return ""
-
-
-# ---------------- 预算不足检测(只拦对话式) ----------------
-
-
-_MIN_TTL_SECONDS = 6 * 3600  # 最低花费按路线缓存 6h,跨会话复用
-_MIN_CACHE: dict[str, tuple[float, float]] = {}  # sig -> (存入时间, 最低总花费)
-
-
-def _estimate_min_total(dep: str, dest: str, day_count: int, travelers: int) -> float | None:
-    """DeepSeek 估"最省也现实可行"的总花费(含往返大交通);失败返回 None = 不拦截。"""
-    sig = route_sig(dep, dest, day_count, travelers)
-    item = _MIN_CACHE.get(sig)
-    if item and time.time() - item[0] < _MIN_TTL_SECONDS:
-        return item[1]
-    llm = build_chat_llm()
-    if llm is None:
-        return None
-    prompt = (
-        f"请估算:从{dep}出发到{dest}旅行 {day_count} 天、共 {travelers} 人,"
-        f"按最省但现实可行(往返选最便宜的长途交通,住宿经济型/合住,吃饭从简,"
-        f"市内公共交通,只去标志性景点)安排,全程含往返大交通的总花费大约最低要多少元。"
-        f"只输出一个 JSON 对象:{chr(123)}min_total:整数{chr(125)}。"
-    )
-    try:
-        resp = llm.invoke([("system", "你是旅行成本估算器,只回答数字,不解释。"), ("human", prompt)])
-        frag = _extract_json_object(str(getattr(resp, "content", "")))
-        if frag:
-            v = float(json.loads(frag).get("min_total"))
-            if 0 < v < 10_000_000:
-                _MIN_CACHE[sig] = (time.time(), v)
-                return v
-    except Exception:
-        pass  # 估算失败不缓存、不拦截,避免打断对话
-    return None
-
-
-def _low_block(params: dict, insisted_sig: str = "") -> dict | None:
-    """预算远低于路线最低花费且用户尚未接受压缩时,返回 {budget_total, min_total, sig};否则 None。"""
-    dep = str(params.get("departure") or "").strip()
-    dest = str(params.get("destination") or "").strip()
-    day_count = resolved_days(params)
-    if not dep or not dest or not day_count:
-        return None
-    travelers = resolved_travelers(params)
-    budget_total = budget_total_of(params)
-    if budget_total is None:
-        return None
-    min_total = _estimate_min_total(dep, dest, day_count, travelers)
-    if min_total is None or budget_total >= min_total:
-        return None
-    sig = route_sig(dep, dest, day_count, travelers)
-    if insisted_sig == sig:
-        return None
-    return {"budget_total": budget_total, "min_total": min_total, "sig": sig}
 
 
 def _generate_from_params(p: dict):
@@ -367,9 +247,10 @@ def handle_turn(thread_id: str, message: str = "", action: str = "chat") -> dict
                 "status": "collecting",
                 "ready": False,
                 "params": state["params"] or None,
+                "intent": "plan",
             }
         # 预算过低且没接受"按最省":确认也拦下,把提醒写回对话(下次生成时模型知道劝过)
-        block = _low_block(state["params"], str(state.get("insisted_sig") or ""))
+        block = low_block(state["params"], str(state.get("insisted_sig") or ""))
         if block:
             mb = round(block["min_total"])
             bt = round(block["budget_total"])
@@ -388,6 +269,7 @@ def handle_turn(thread_id: str, message: str = "", action: str = "chat") -> dict
                 "params": state["params"] or None,
                 "low_budget": True,
                 "min_budget": mb,
+                "intent": "plan",
             }
         try:
             plan = _generate_from_params(state["params"])
@@ -397,6 +279,7 @@ def handle_turn(thread_id: str, message: str = "", action: str = "chat") -> dict
                 "status": "generation_failed",
                 "ready": True,
                 "params": state["params"] or None,
+                "intent": "plan",
             }
         return {
             "reply": "行程已按对话整理生成,正在为你打开。",
@@ -404,6 +287,7 @@ def handle_turn(thread_id: str, message: str = "", action: str = "chat") -> dict
             "ready": True,
             "params": state["params"] or None,
             "plan": plan.model_dump(),
+            "intent": "plan",
         }
 
     state["messages"] = list(state["messages"])
@@ -422,6 +306,8 @@ def handle_turn(thread_id: str, message: str = "", action: str = "chat") -> dict
         "status": out.get("status", "collecting"),
         "ready": out.get("ready", False),
         "params": final_params or None,
+        # 本轮 supervisor 判出的意图。Step 2 阶段只观察不路由;Java 侧按名取字段,多余字段无影响
+        "intent": out.get("intent"),
     }
     if out.get("low_budget"):
         result["low_budget"] = True
