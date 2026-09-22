@@ -13,7 +13,8 @@
 | Step 2b 换图 | ✅ 已完成 (2026-09-22) | `agents/chitchat.py` + `graph/builder.py`(路由表)。闲聊/参数齐两条路径与改造前逐项一致 |
 | Step 3a RAG 工具化 | ✅ 已完成 (2026-09-22) | `tools/rag_tool.py` 两个工具 + `rag/retrieve.py` 熔断。Milvus 挂时 11.04s → 0.00s |
 | Step 3b Retriever 专家 | ✅ 已完成 (2026-09-22) | `agents/retriever.py`(function calling 循环)+ `agents/base.py`(第二个消费者出现,公共件才抽)+ 接上 `guide` 分支。**话术集 15/15,攻略回复带真实资料** |
-| Step 4 ~ Step 9 | ⬜ 未开始 | |
+| Step 4 Budget 专家 | ✅ 已完成 (2026-09-22) | `agents/budget.py` 加 `budget_node` + `block_state`(护栏口径统一);接上 `budget` 分支 |
+| Step 5 ~ Step 9 | ⬜ 未开始 | |
 
 ### 实施中的偏离记录
 
@@ -26,6 +27,7 @@
 - ~~**Milvus 不可用时 `rag/retrieve.py:retrieve()` 空转 10.9 秒**~~ → **Step 3a 已修**(`_BREAKER` 熔断,`RAG_BREAKER_TTL_SECONDS` 默认 60s)。注意 TTL 到期后会再真试一次,所以 Milvus 长期挂掉时,每 60 秒仍会有一轮多等 11 秒;这是刻意的(不通就恢复),不是回归。
 - **Redis 挂掉时每轮对话白等约 95 秒**(未处理,优先级高):`chat.py:_load_state`/`_save_state` 每次新建连接,`socket_connect_timeout=2` 只约束建立连接,不约束 redis-py 的重试退避。实测 Redis 停机时 load 47.1s + save 48.4s = 每轮 ~95s,而 LLM 本身只要 1s。这与上面 Milvus 那条同源(依赖不可用时慢重试),同一套熔断/短路思路可解:加 socket_timeout、或连续失败后进"不可用"窗口直接走 `_MEM`。**不属 Step 3 范围,单独排期。**
 - **验证环境提示**:probe 的耗时读数只有在 Redis、Milvus 都起来时才有意义;否则量到的是重试退避而不是业务耗时。
+- **`estimate_min_total` 冷启动约 26~30 秒**(既有行为,Step 4 暴露出来):模型对这条估算 prompt 会先输出一大段看不见的推理,再吐 18 个字符的 JSON(实测 25.7s 出 `{"min_total":1800}`)。按路线缓存 6h,所以**同一路线只慢第一次**,之后 0.00s。Step 4 之后 budget 路由在「回答够不够」时就会触发这个冷启动,比改造前(只在确认护栏时触发)更容易被用户撞上。可选修法:估算结果落 Redis 跨进程复用 / 换更快的估算方式 / 接受 6h 一次。**属设计取舍,留给用户定。**
 
 ---
 
@@ -174,11 +176,23 @@ ai-service/app/
 - **没做的一件事**:`retriever` 没有复用 `base.history_messages`,而是自己拼 SystemMessage + `base.history_messages`;这是同一份实现,没有分叉。
 - 验证结果:`guide` 两问均 `trace: supervisor→retriever` 且回复带真实菜品(酸辣鱼/乳扇/砂锅米线/喜洲粑粑/凉鸡米线),并主动声明"哪家店、价格、营业时间没有可靠资料就不瞎推荐";话术集 **15/15**;闲聊、参数齐、预算过低拦截(含「就按最省的吧」→ `await_confirm`)三条路径均无回归。
 
-### Step 4 · Budget 专家(预算独立成节点)
+### Step 4 · Budget 专家(预算独立成节点)✅ 已完成
 - 新建 `app/agents/budget.py`:`_estimate_min_total` / `_low_block` 从 `chat.py` 迁入,保持缓存与口径不变
 - 改 `app/chat.py`:confirm 分支改为调用 `agents.budget.low_block`
 - 改 `app/graph/builder.py`:接上 `budget` 分支
 - 验证:说「我一共就 1500 块,够去大理 5 天吗」→ `intent=budget`,回复给出最低花费估算;现有「确认被按灰」的预算护栏仍生效
+
+**实际做法与计划的两处差异**:
+- `budget.py` 在 Step 2a 已建(为断开循环依赖),本步只**加节点**,没有"迁入"动作。
+- **多抽了一个 `block_state()`**:两个节点(chitchat / budget)现在都要做"按住确认"这件事,而同一句话走不同路由必须给出同一个 `min_budget`。原来 `min_budget = round(block["min_total"])` 写在 chitchat 里,现在两处共用一份,数字只在一处 round。`chat.py` 的 confirm 护栏仍用更底层的 `low_block`(它只要 boolean + 文案,不需要状态字段)。
+- 关键信息不全时(如只说了"大理 5 天 1500 块"没说出发地)路由到 budget 也能安全应答:节点提示模型"先问清楚,别给数字",实测回复确实只要出发地/人数、没编数字。
+
+**验证结果**:
+- `bud-1`「我一共就 1500 块,够去大理 5 天吗」→ `intent=budget`,`trace: supervisor→budget`,反问出发地与人数(不编数字)
+- `bud-3`「那我 3000 块够吗」(已补北京)→ `intent=budget`,"还是不够,差大概 1500",并保留「就按最省的吧」的口子
+- `bud-ok`「上海出发去桂林 6 天,预算 9000 够吗」→ `intent=budget`,`status=await_confirm`、`ready=true`,引用估算 8400 对比预算
+- **口径一致**:`bud-2`「我们从北京出发」被 supervisor 判成 `collect` 走了 chitchat,但 chitchat 的护栏给出 `min_budget=4500`,与 budget 路由给的值完全相同
+- 无回归:预算充足(`reg-a`,8000)仍是 `await_confirm` 不被误拦;攻略路由(`reg-b`)仍 `supervisor→retriever` 且带真实菜品
 
 ### Step 5 · Weather 专家(唯一跨服务改动)
 - 后端新建 `InternalWeatherController`(`GET /internal/weather?city=`,校验 `X-AI-Service-Key`,不要求登录)
