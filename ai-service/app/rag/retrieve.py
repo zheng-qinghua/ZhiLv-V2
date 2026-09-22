@@ -1,8 +1,14 @@
 """召回:query 嵌入 → Milvus 取 chunk_id → MySQL 取原文。任一端不可用都静默降级为空列表,
-对话照常走(不带知识库),不让 RAG 故障打断主流程。"""
+对话照常走(不带知识库),不让 RAG 故障打断主流程。
+
+熔断:Milvus 挂掉时 pymilvus 每次都要重试约 10 秒才抛异常。若不做处理,每轮对话都白等
+这 10 秒(连嵌入的 1 秒也白花)。所以检测到连续失败后,在 RAG_BREAKER_TTL_SECONDS 内
+直接返回空,不再发起请求;TTL 过期后再真试一次,通了就恢复。"""
 from __future__ import annotations
 
-from app.config import RAG_TOP_K
+import time
+
+from app.config import RAG_BREAKER_TTL_SECONDS, RAG_TOP_K
 from app.rag.embed import embed_texts
 from app.rag.store import (
     fetch_chunks_by_ids,
@@ -11,8 +17,17 @@ from app.rag.store import (
     search_vectors,
 )
 
+# Milvus 熔断状态:记录"到什么时候为止认为它不可用"。用 dict 而非 global 变量,少一处 global 声明
+_BREAKER: dict[str, float] = {"milvus_ok_after": 0.0}
+
+
+def _milvus_is_down() -> bool:
+    return time.time() < _BREAKER["milvus_ok_after"]
+
 
 def retrieve(query_text: str, top_k: int | None = None) -> list[dict]:
+    if _milvus_is_down():
+        return []  # 已知不可用:直接降级,不浪费嵌入和 10 秒重试
     top_k = top_k or RAG_TOP_K
     try:
         vecs = embed_texts([query_text])
@@ -22,7 +37,9 @@ def retrieve(query_text: str, top_k: int | None = None) -> list[dict]:
         return []
     try:
         hits = search_vectors(vecs[0], top_k)
+        _BREAKER["milvus_ok_after"] = 0.0  # 这次通了,恢复正常
     except Exception:
+        _BREAKER["milvus_ok_after"] = time.time() + RAG_BREAKER_TTL_SECONDS
         return []
     meta = fetch_chunks_by_ids([h["chunk_id"] for h in hits])
     results = []
