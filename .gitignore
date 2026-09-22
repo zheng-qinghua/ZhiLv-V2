@@ -1,0 +1,33 @@
+# ================= 敏感配置:绝不提交 =================
+# 真实密钥只写在 .env 里(ai-service/.env:LLM + 嵌入 key;frontend/.env:高德 key)
+.env
+.env.local
+ai-service/.env
+frontend/.env
+
+# ================= Python =================
+ai-service/.venv/
+__pycache__/
+*.py[cod]
+
+# ================= 日志 =================
+*.log
+
+# ================= Node / 前端 =================
+frontend/node_modules/
+frontend/dist/
+
+# ================= Java / Maven =================
+backend/target/
+
+# ================= 运行时数据:体积大且可重建 =================
+# Milvus standalone 的 volumes(向量数据),换机器重建即可
+deploy/volumes/
+deploy/milvus/volumes/
+
+# ================= 编辑器 / 系统 =================
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
