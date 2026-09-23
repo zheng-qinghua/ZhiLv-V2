@@ -15,7 +15,7 @@
 | Step 3b Retriever 专家 | ✅ 已完成 (2026-09-22) | `agents/retriever.py`(function calling 循环)+ `agents/base.py`(第二个消费者出现,公共件才抽)+ 接上 `guide` 分支。**话术集 15/15,攻略回复带真实资料** |
 | Step 4 Budget 专家 | ✅ 已完成 (2026-09-22) | `agents/budget.py` 加 `budget_node` + `block_state`(护栏口径统一);接上 `budget` 分支 |
 | Step 5a Java 内部天气接口 | ✅ 已完成 (2026-09-23) | `InternalWeatherController` + `app.ai.service-key`。真 key 实测返回大理 4 天预报(0.51s) |
-| Step 5b Weather 专家 | ⬜ 未开始 | |
+| Step 5b Weather 专家 | ✅ 已完成 (2026-09-23) | `tools/weather_tool.py` + `agents/weather.py`;工具循环提到 `base.tool_loop`。**话术集 15/15,回复带真实预报且日期算对(今天/明天/后天)** |
 | Step 6 ~ Step 9 | ⬜ 未开始 | |
 
 ### 实施中的偏离记录
@@ -23,11 +23,14 @@
 - **Step 2 拆成 2a/2b**:先加 supervisor 节点但不改路由,用话术集单独验证分类质量,再换图。好处是分类回归失败时不必回滚图结构。
 - **不在 Step 2 建 `agents/base.py`**:当时只有一个回复型节点,抽公共 prompt 是过度设计;等 Step 3 有了 retriever 这第二个消费者再抽。
 - **`agents/budget.py` 提前到 Step 2a**:chitchat 要用 `low_block`,而 chitchat 被图引用,不能再反向 import 入口 `chat.py`,否则循环依赖。所以预算模块必须先独立;Step 4 只剩「接分支 + 做成独立节点」。
+- **Step 5b 从「直接查 params.destination」改成 function calling**:实测 supervisor 对天气问句的目的地抽取不稳(「大理明天天气怎么样」4 次里 1 次抽不到 → 节点不知道该查哪个城市,只能回「查不到」)。改由模型读对话定城市后,构造「params 为空 + 话里有城市名」的用例连测 3 次全部答对。代价是多一轮 LLM(~1.5s),换来的是抽取抖动不再影响可用性。
+- **`base.tool_loop` 提到公共处**:retriever 和 weather 各要一份工具循环(第二个消费者出现),所以按既有约定上移;retriever 自身删掉本地循环,行为不变(tw-3 复测仍带真实菜品)。
+- **Step 5b 没做 `state["weather"]` 缓存**:原计划把预报写进该字段给 planner 复用,但天气改走工具后节点手里没有"这次查的是哪个城市"的确切记录(城市由模型定,可能一次查多个)。与其加一层 last-fetch 全局态,不如让 Step 9 的 planner 直接调 `fetch_forecast(destination)`(实测 0.4s,确定性,不依赖模型)。`ChatState.weather` 字段暂留空,Step 9 再定去留。
 
 ### 已发现的既有问题(非本次改造引入,待处理)
 
 - ~~**Milvus 不可用时 `rag/retrieve.py:retrieve()` 空转 10.9 秒**~~ → **Step 3a 已修**(`_BREAKER` 熔断,`RAG_BREAKER_TTL_SECONDS` 默认 60s)。注意 TTL 到期后会再真试一次,所以 Milvus 长期挂掉时,每 60 秒仍会有一轮多等 11 秒;这是刻意的(不通就恢复),不是回归。
-- **Redis 挂掉时每轮对话白等约 95 秒**(未处理,优先级高):`chat.py:_load_state`/`_save_state` 每次新建连接,`socket_connect_timeout=2` 只约束建立连接,不约束 redis-py 的重试退避。实测 Redis 停机时 load 47.1s + save 48.4s = 每轮 ~95s,而 LLM 本身只要 1s。这与上面 Milvus 那条同源(依赖不可用时慢重试),同一套熔断/短路思路可解:加 socket_timeout、或连续失败后进"不可用"窗口直接走 `_MEM`。**不属 Step 3 范围,单独排期。**
+- **Redis 挂掉时每轮对话白等约 95 秒**(未处理,**当前项目最影响体验的问题,建议优先单独排期**):`chat.py:_load_state`/`_save_state` 每次新建连接,`socket_connect_timeout=2` 只约束建立连接,不约束 redis-py 的重试退避。实测 Redis 停机时 load 47.1s + save 48.4s = 每轮 ~95s,而 LLM 本身只要 1s。Session 期间 Redis 进程死过一次,同一条消息从 3s 变成 101s,是这个原因、不是某一步改造引入。这与上面 Milvus 那条同源(依赖不可用时慢重试),同一套熔断/短路思路可解:加 `socket_timeout`、或连续失败后进"不可用"窗口直接走 `_MEM`。
 - **验证环境提示**:probe 的耗时读数只有在 Redis、Milvus 都起来时才有意义;否则量到的是重试退避而不是业务耗时。
 - **`estimate_min_total` 冷启动约 26~30 秒**(既有行为,Step 4 暴露出来):模型对这条估算 prompt 会先输出一大段看不见的推理,再吐 18 个字符的 JSON(实测 25.7s 出 `{"min_total":1800}`)。按路线缓存 6h,所以**同一路线只慢第一次**,之后 0.00s。Step 4 之后 budget 路由在「回答够不够」时就会触发这个冷启动,比改造前(只在确认护栏时触发)更容易被用户撞上。可选修法:估算结果落 Redis 跨进程复用 / 换更快的估算方式 / 接受 6h 一次。**属设计取舍,留给用户定。**
 
@@ -219,10 +222,29 @@ ai-service/app/
 
 - **顺带发现(既有行为,非本次引入)**:高德地理编码对不存在的地名不报错,而是匹配到别处(实测 `???xyz` 返回了「兴庆区/宁夏」)。即目的地是编造的地名时,天气会静默串到别的城市。weather Agent 的 prompt 里要提醒"资料与目的地不符就别报"。
 
-**5b · Python 侧 Weather 专家 ⬜ 未开始**
-- 新建 `app/tools/weather_tool.py`(调 Java)、`app/agents/weather.py`;查到的预报写进 `state["weather"]` 缓存
+**5b · Python 侧 Weather 专家 ✅ 已完成**
+- 新建 `app/tools/weather_tool.py`(调 Java)、`app/agents/weather.py`
 - 改 `app/graph/builder.py`:接上 `weather` 分支;`app/config.py` 加 `JAVA_BASE_URL` / `AI_SERVICE_KEY`
 - 验证:说「大理明天天气怎么样」→ `intent=weather`,回复带真实预报;把 Java 停掉再问 → 回复降级为「暂时查不到天气」,**不报错**
+
+实际做法:
+- **没做 `state["weather"]` 缓存**(理由见上面偏离记录),`chat.py` 未改。
+- `fetch_forecast()` 用标准库 `urllib`(不引新依赖),401/400/502/超时/Java 没起全在一个 `except` 里返回 `None`。
+- 预报文本里给「今天」那条打上 `(今天)` 标记 —— 让模型算"明天/后天"时不依赖它自己的日期直觉。
+- 星期的口径核对过:高德 `week` 字段 = ISO 星期(2026-09-23 返回 `3`,Python `isoweekday()` 也是 3),所以直接映射成周一~周日,没有偏移。
+
+验证结果:
+
+| 用例 | 结果 |
+|---|---|
+| 「大理明天天气怎么样」 | `intent=weather`,5.3s,「明天(9月24日 周四)多云,14~25℃,西南风」,**与预报一致** |
+| 「后天会下雨吗」(承接上一轮) | 3.2s,正确算成 9月25日 周五 多云,**未答错日子** |
+| params 为空但话里有城市名(模拟抽取失败)×3 | 3/3 都查到并答对 —— 这正是改用 function calling 要解决的问题 |
+| Java 停机 | 6.8s,「暂时查不到大理的天气数据…建议打开天气 App」,**无异常、status 正常** |
+| 攻略路由(回归) | 仍 `supervisor→retriever`,回复带真实菜品 |
+| 话术集 | **15/15** |
+
+- 耗时参考(Redis 正常时):weather ~3~5s、retriever ~3~4s、chitchat ~1.6s、budget 冷启动 ~25s(估算缓存)。
 
 ### Step 6 · Planner 专家 + 生成回流到图
 - 新建 `app/agents/planner.py`:包 `generate_trip_plan`,产出写进 `state["plan"]`(Reviser 后续要用)

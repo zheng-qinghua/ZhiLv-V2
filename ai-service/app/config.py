@@ -14,6 +14,11 @@ load_dotenv(BASE_DIR / ".env")
 # ---- 服务 ----
 SERVICE_PORT = int(os.getenv("SERVICE_PORT", "8100"))
 
+# ---- Java 后端(weather Agent 回调用;/internal/** 用共享密钥校验)----
+# 默认值与 backend 的 app.ai.service-key 默认值一致,本地零配置可跑;生产两边都要覆盖
+JAVA_BASE_URL = os.getenv("JAVA_BASE_URL", "http://localhost:8080")
+AI_SERVICE_KEY = os.getenv("AI_SERVICE_KEY", "zhilv-internal-dev-key")
+
 # ---- Redis(对话状态持久化,native JSON,本机 6379 无密码)----
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
