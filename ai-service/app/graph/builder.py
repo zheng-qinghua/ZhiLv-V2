@@ -36,7 +36,7 @@ ROUTES: dict[str, str] = {
     "budget": "budget",     # 预算够不够 → 路线最低花费估算 + 预算护栏
     "weather": "weather",   # 天气 → 回调 Java /internal/weather(高德 key 在 Java)
     "plan": "planner",      # 生成行程 → planner → critic(不过关再 reviser)
-    # "revise": "reviser",      # Step 8
+    "revise": "reviser",    # 用户主动改行程(supervisor 已保证此时 state["plan"] 非空)
 }
 
 

@@ -174,9 +174,12 @@ JSON 结构示例:
             "人数与预算口径;不要编造指南之外的细节名目与价格。"
         )
     if correction:
+        # 标题写成中性的是因为这段有四个来源:解析失败重试、critic 的 issues、
+        # 用户主动要求改行程、以及"轮次用尽仍不合格"的兜底。写死"未通过校验"对
+        # 后两种来源语义不对,模型会以为自己在修 bug 而不是在执行用户指令。
         human_prompt += (
-            f"\n\n=== 上次生成未通过校验 ===\n{correction}\n"
-            f"请据此修正,重新输出一份完整 JSON。必须是正好 {day_count} 天,"
+            f"\n\n=== 这次必须落实的调整要求 ===\n{correction}\n"
+            f"请据此调整,重新输出一份完整 JSON。必须是正好 {day_count} 天,"
             f"每 天都要有 spots,不要省略任何一天,不要加任何解释文字。"
         )
     return system_prompt, human_prompt

@@ -104,9 +104,10 @@ def _apply_guards(intent: str, params: dict, state: ChatState) -> str:
     # 说要生成,但出发地/目的地/时间还没齐 → 先回去追问,别硬生成
     if intent == "plan" and missing_params(params):
         return "collect"
-    # 说要改行程,但手上还没有行程 → 当闲聊处理(Step 8 接 reviser 时细化话术)
-    if intent == "revise" and not state.get("plan"):
-        return "chitchat"
+    # 注意:"说改行程但手上没有行程"这条守卫**不在这里**,在 reviser_node 里。
+    # 放在这里只能降级成 chitchat,而 chitchat 会顺着用户的话往下答("好的,第2天全
+    # 安排室内"),像是答应了要改一份并不存在的行程。由 reviser 自己回一句
+    # 「我得先有一份行程才能改」才对,而 supervisor 是路由、不产出话术。
     return intent
 
 
