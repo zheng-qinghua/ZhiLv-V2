@@ -26,9 +26,8 @@ from __future__ import annotations
 import json
 
 from app.agents import base
-from app.agents.planner import _gen_rag_context, build_request
+from app.agents.planner import build_request, generate_plan
 from app.graph.state import ChatState
-from app.llm import generate_trip_plan
 
 MAX_REVISION_ROUNDS = 1  # 只修一轮:模型改不动的毛病,再喂一遍也是改不动,只是多烧一次时间
 
@@ -115,9 +114,7 @@ def reviser_node(state: ChatState) -> dict:
     feedback, reply = picked
 
     try:
-        req = build_request(params)
-        plan = generate_trip_plan(req, rag_context=_gen_rag_context(req.destination),
-                                  feedback=feedback)
+        plan = generate_plan(build_request(params), feedback=feedback)
     except Exception as exc:
         # 改失败了但手上那版行程还在:状态仍算可用,别让前端把用户的行程页关掉
         return {"revision_round": round_ + 1, "status": "generated", "ready": True,

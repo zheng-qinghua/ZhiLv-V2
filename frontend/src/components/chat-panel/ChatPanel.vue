@@ -18,7 +18,19 @@ function toPlan(record: TripRecord): TripPlan {
 interface ChatMsg {
   role: "user" | "ai";
   content: string;
+  intent?: string | null; // supervisor 的路由结果,仅用于气泡小标签
 }
+
+/** 意图 → 中文标签。纯展示:认不出的意图就不显示标签,不影响任何逻辑。 */
+const INTENT_LABEL: Record<string, string> = {
+  chitchat: "闲聊",
+  collect: "信息收集",
+  guide: "攻略专家",
+  weather: "天气专家",
+  budget: "预算专家",
+  plan: "行程生成",
+  revise: "行程修订",
+};
 
 const messages = ref<ChatMsg[]>([]);
 const input = ref("");
@@ -168,7 +180,7 @@ async function onSend() {
       sessionId.value = created.id;
     }
     const turn = await sendChatMessage(sessionId.value, text, "chat");
-    if (turn.reply) messages.value.push({ role: "ai", content: turn.reply });
+    if (turn.reply) messages.value.push({ role: "ai", content: turn.reply, intent: turn.intent });
     applyParams(turn.params);
     confirmReady.value = !!turn.ready;
     applyBudgetFlag(turn);
@@ -195,7 +207,7 @@ async function onConfirm() {
       return;
     }
     // 没成功生成(如预算不足/生成失败):展示原因并保持继续聊
-    if (turn.reply) messages.value.push({ role: "ai", content: turn.reply });
+    if (turn.reply) messages.value.push({ role: "ai", content: turn.reply, intent: turn.intent });
     applyParams(turn.params);
     confirmReady.value = !!turn.ready;
     applyBudgetFlag(turn);
@@ -257,7 +269,10 @@ startNewConversation();
           :class="['msg-row', m.role === 'user' ? 'msg-row--user' : 'msg-row--ai']"
         >
           <div :class="['msg-bubble', m.role === 'user' ? 'msg-bubble--user' : 'msg-bubble--ai']">
-            {{ m.content }}
+            <span
+              v-if="m.role === 'ai' && m.intent && INTENT_LABEL[m.intent]"
+              class="msg-badge"
+            >{{ INTENT_LABEL[m.intent] }}</span>{{ m.content }}
           </div>
         </div>
         <!-- 等待 Agent 回复/生成行程中的加载气泡 -->
@@ -428,6 +443,21 @@ startNewConversation();
   background: #f2f2f7;
   color: #1c1c1e;
   border-bottom-left-radius: 6px;
+}
+
+/* 气泡小标签(supervisor 路由结果)。
+   用 block + width:max-content 让它独占一行,正文跟在下一行;
+   模板里 </span>{{ content }} 紧挨着写,不在 pre-wrap 下多出一个换行。 */
+.msg-badge {
+  display: block;
+  width: max-content;
+  margin-bottom: 5px;
+  padding: 1px 7px;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #007aff;
+  background: rgba(0, 122, 255, 0.12);
 }
 
 /* 等待 Agent 回复:圈式加载 + 文案 */
