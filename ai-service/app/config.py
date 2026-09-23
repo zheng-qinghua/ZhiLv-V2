@@ -22,6 +22,10 @@ AI_SERVICE_KEY = os.getenv("AI_SERVICE_KEY", "zhilv-internal-dev-key")
 # ---- Redis(对话状态持久化,native JSON,本机 6379 无密码)----
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+# Redis 不可达时,单次读写最多等这么久就放弃、改走进程内兜底。
+# 别名 localhost 会先试 IPv6(::1)再试 IPv4,两次各等满这个超时,所以:
+#   每轮对话多等 ≈ 这个值 × 4(load 2 次 + save 2 次)。别调大。
+REDIS_SOCKET_TIMEOUT_SECONDS = float(os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "0.5"))
 
 # ---- 大模型(OpenAI 兼容接口,DeepSeek / 中转渠道都用这套)----
 # 你指定的模型,key / base_url 由你填进 ai-service/.env
