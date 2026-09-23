@@ -77,7 +77,7 @@ public class ChatService {
             TripPlan plan = objectMapper.convertValue(resp.plan(), TripPlan.class);
             Trip trip = tripService.createFromPlan(userId, plan);
             return new ChatTurnResponse(resp.reply(), resp.status(), resp.ready(),
-                    resp.params(), null, trip, resp.lowBudget(), resp.minBudget());
+                    resp.params(), null, trip, resp.lowBudget(), resp.minBudget(), resp.intent());
         }
         return resp;
     }

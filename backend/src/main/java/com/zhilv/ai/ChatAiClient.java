@@ -66,7 +66,8 @@ public class ChatAiClient {
                     nodeToParams(root.get("plan")),
                     null,
                     lowBudget,
-                    minBudget);
+                    minBudget,
+                    text(root, "intent", null));
         } catch (BusinessException e) {
             throw e;
         } catch (InterruptedException e) {

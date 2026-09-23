@@ -104,7 +104,9 @@ export interface ChatSession {
 /** 一轮对话返回(ai-service /chat 透传)
  *  status: collecting(继续聊) | await_confirm | budget_low(预算不足被拦截) | generated(已生成,待保存) | failed
  *  trip: 确认生成那轮后端已落库的 CHAT 行程实体;前端据此跳结果页
- *  lowBudget/minBudget: 预算低于路线最低花费时置位(minBudget 为预估最低总额,含往返大交通) */
+ *  lowBudget/minBudget: 预算低于路线最低花费时置位(minBudget 为预估最低总额,含往返大交通)
+ *  intent: supervisor 判定的本轮意图(chitchat/collect/guide/weather/budget/plan/revise),
+ *          前端只拿它做气泡小标签,不据此改任何行为 */
 export interface ChatTurnResponse {
   reply: string;
   status: string;
@@ -113,4 +115,5 @@ export interface ChatTurnResponse {
   lowBudget?: boolean | null;
   minBudget?: number | null;
   trip?: TripRecord | null;
+  intent?: string | null;
 }

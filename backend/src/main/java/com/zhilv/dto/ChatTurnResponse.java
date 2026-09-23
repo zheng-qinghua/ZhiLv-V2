@@ -14,6 +14,8 @@ import java.util.Map;
  * trip:   已落库的行程实体(CHAT 来源),仅 generated 轮有(前端据此跳结果页)。
  * lowBudget / minBudget: ai-service 判定"用户预算低于路线最低花费"时置位;
  *         minBudget 为预估最低总花费(含往返大交通),前端据此提示用户加预算/接受压缩。
+ * intent: supervisor 判定的本轮意图(chitchat/guide/weather/budget/collect/plan/revise)。
+ *         只透传,Java 不解读 —— 前端拿它做气泡小标签,测试拿它统计路由准确率。
  */
 public record ChatTurnResponse(
         String reply,
@@ -23,16 +25,17 @@ public record ChatTurnResponse(
         Map<String, Object> plan,
         Trip trip,
         Boolean lowBudget,
-        Double minBudget
+        Double minBudget,
+        String intent
 ) {
     /** 普通对话轮:没有生成结果,也没有预算拦截 */
     public ChatTurnResponse(String reply, String status, Boolean ready, Map<String, Object> params) {
-        this(reply, status, ready, params, null, null, null, null);
+        this(reply, status, ready, params, null, null, null, null, null);
     }
 
     /** 携带完整 TripPlan 的构造(落库与否由 ChatService 判断) */
     public ChatTurnResponse(String reply, String status, Boolean ready,
                             Map<String, Object> params, Map<String, Object> plan) {
-        this(reply, status, ready, params, plan, null, null, null);
+        this(reply, status, ready, params, plan, null, null, null, null);
     }
 }

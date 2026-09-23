@@ -27,6 +27,11 @@ from app.graph.state import ChatState
 from app.llm import generate_trip_plan
 from app.models import TripRequest
 from app.rag.retrieve import format_for_prompt, format_guide_by_city, retrieve
+from app.tools.weather_tool import fetch_forecast, format_forecast
+
+# 高德 weatherInfo?extensions=all 只回 4 天(今天 + 未来 3 天)。行程起始日超出这个窗口时,
+# 预报一天都盖不到行程上,硬塞进去只会让模型拿"这周的雨"去安排"下个月的行程"。
+_WEATHER_HORIZON_DAYS = 3
 
 
 def _gen_rag_context(dest: str) -> str:
@@ -38,6 +43,35 @@ def _gen_rag_context(dest: str) -> str:
         return format_for_prompt(retrieve(f"{dest} 旅游攻略"))
     except Exception:
         return ""
+
+
+def _gen_weather_note(req: TripRequest) -> str:
+    """行程起始日在预报窗口内才给预报;否则空串(那份预报管不到那几天)。
+
+    这里是**确定性调用**,不走模型、不依赖 state["weather"](那个字段一直留空),
+    取不到就返回空串 —— 没有天气照样能生成行程。
+    """
+    start = to_date(req.start_date)
+    if start is None:
+        return ""
+    ahead = (start - date.today()).days
+    if not (0 <= ahead <= _WEATHER_HORIZON_DAYS):
+        return ""
+    try:
+        return format_forecast(fetch_forecast(req.destination) or {}, limit=6)
+    except Exception:
+        return ""
+
+
+def generate_plan(req: TripRequest, feedback: str | None = None):
+    """带上下文(攻略 + 天气)生成一份行程。planner 和 reviser 共用这一个入口,
+    免得两边各拼一遍 context —— 拼漏了就会"初版看天气、改版不看",很难查。"""
+    return generate_trip_plan(
+        req,
+        rag_context=_gen_rag_context(req.destination),
+        weather_note=_gen_weather_note(req),
+        feedback=feedback,
+    )
 
 
 def build_request(p: dict) -> TripRequest:
@@ -63,6 +97,12 @@ def build_request(p: dict) -> TripRequest:
     total_days = to_int(p.get("total_days"), 0)
     if start and end and end >= start:
         start_d, end_d = start, end
+    elif start:
+        # 常见说法是「10月1号出发,玩5天」——只有出发日、天数在 total_days 里。
+        # 这一支必须排在 total_days 前面,否则用户给的出发日会被换成今天(实测踩到过:
+        # 10月1号的行程排成了今天出发,顺带让天气注入的日期判断全部落在"今天")。
+        start_d = start
+        end_d = start + timedelta(days=total_days - 1) if total_days >= 1 else start
     elif total_days >= 1:
         start_d, end_d = date.today(), date.today() + timedelta(days=total_days - 1)
     else:
@@ -96,8 +136,7 @@ def build_request(p: dict) -> TripRequest:
 
 def _generate_from_params(p: dict):
     """解析参数并生成 TripPlan(planner 节点用)。"""
-    req = build_request(p)
-    return generate_trip_plan(req, rag_context=_gen_rag_context(req.destination))
+    return generate_plan(build_request(p))
 
 
 def _collecting_reply(params: dict) -> str:

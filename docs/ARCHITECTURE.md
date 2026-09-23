@@ -159,15 +159,30 @@
 │       ├── dto/                   # 请求/响应对象(含 TripPlan)
 │       ├── ai/                    # Python AI 服务客户端(SSE 透传)
 │       └── common/                # 统一响应体、异常处理、工具
-├── ai-service/                    # Python FastAPI + LangGraph
+├── ai-service/                    # Python FastAPI + LangGraph(多 Agent:Supervisor + 专家)
 │   ├── requirements.txt
 │   ├── app/
-│   │   ├── main.py                # FastAPI 入口(仅作为服务载体)
-│   │   ├── graph/                 # LangGraph 图定义(状态、节点、边)
-│   │   ├── agents/                # 工具、提示词、Agent 逻辑
-│   │   ├── rag/                   # 检索器、向量库、攻略索引
-│   │   ├── models/                # 结构化输出 Pydantic 模型
-│   │   └── config.py              # LLM API 配置
+│   │   ├── main.py                # FastAPI 入口(/health /generate /chat)
+│   │   ├── chat.py                # 对话入口:Redis 会话状态读写 + handle_turn
+│   │   ├── llm.py                 # LLM 调用与行程生成(含结果缓存、重试)
+│   │   ├── config.py              # LLM/Redis/RAG/Java 连接配置
+│   │   ├── graph/                 # 图定义与共享工具
+│   │   │   ├── builder.py         # 两个编译好的图:GRAPH / GENERATE_GRAPH
+│   │   │   ├── state.py           # ChatState(扁平 dict)
+│   │   │   └── params.py          # 参数白名单、门槛判断、取值解析
+│   │   ├── agents/                # 各专家节点
+│   │   │   ├── supervisor.py      # 一轮一次 LLM:意图路由 + 参数抽取
+│   │   │   ├── chitchat.py        # 闲聊/追问
+│   │   │   ├── retriever.py       # RAG 攻略问答(工具调用)
+│   │   │   ├── weather.py         # 天气问答(工具调用)
+│   │   │   ├── budget.py          # 预算问答 + 预算护栏
+│   │   │   ├── planner.py         # 生成 TripPlan(表单/对话两条入口共用)
+│   │   │   ├── critic.py          # 纯规则质检(不复用 LLM)
+│   │   │   ├── reviser.py         # 修订(critic 自动 / 用户手动,同一节点)
+│   │   │   └── base.py            # 节点共用:trace、with_reply、工具循环
+│   │   ├── rag/                   # 检索器、向量库、攻略索引、切分、嵌入
+│   │   ├── tools/                 # 供 Agent 调用的工具(RAG 检索、天气)
+│   │   └── models/                # 结构化输出 Pydantic 模型(TripPlan / TripRequest / Chat)
 │   └── tests/
 └── scripts/                       # 启动/初始化脚本
 ```
@@ -213,14 +228,20 @@
 
 ### 对话式
 ```
-前端聊天面板 → POST /api/chat (sessionId, message)
-  → Spring Boot 转发 ai-service /chat (SSE 流式)
-  → Python LangGraph 多轮图:
-      收集信息 → 不够则追问 → 抽齐 → 生成 TripPlan → 完成事件
-  → SSE 流透传前端,前端流式渲染
-  → 生成完成 → 前端跳转 Result.vue(复用)
+前端聊天面板 → POST /api/chat/sessions/{id}/messages (message, action)
+  → Spring Boot 转发 ai-service /chat
+  → Python LangGraph 多 Agent 图(见 docs/MULTI_AGENT_PLAN.md):
+      supervisor(一次 LLM 出「意图 + 参数」)
+        ├ chitchat  闲聊 / 信息不全时追问
+        ├ retriever 攻略问答(工具调用 RAG)
+        ├ weather   天气问答(工具调用 Java /internal/weather)
+        ├ budget    预算问答(含预算护栏)
+        ├ planner → critic →(不过关)reviser → critic   生成并质检行程
+        └ reviser   在已有行程上按用户要求最小改动
+  → 返回 {reply, status, ready, params, plan?, agent_trace}
+  → 前端按 status 渲染气泡;status=generated 时带上 plan → 跳转 Result.vue(复用)
 ```
-
+注:当前为**同步 REST 返回**(不是 SSE 流式),SSE 流式推送为后续演进方向。
 ## 8. 统一行程模型 & 前端 TS 类型
 
 `frontend/src/types/trip.ts` 与 `backend dto/TripPlan` 与 `ai-service/models` 三处字段必须保持一致。**改一处,同步另两处。** 建议以本文档第 3.2 节的 JSON 为准。

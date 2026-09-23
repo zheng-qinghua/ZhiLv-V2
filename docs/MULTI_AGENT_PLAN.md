@@ -20,7 +20,7 @@
 | Step 6 Planner 专家 | ✅ 已完成 (2026-09-23) | `agents/planner.py`(生成逻辑从 chat.py 上移)+ 接上 `plan` 分支;confirm 路径改为直接调 planner 节点。**话术集 15/15,两条生成入口的字段与话术完全一致** |
 | Step 7 Critic + 修订环 | ✅ 已完成 (2026-09-23) | `agents/critic.py`(8 条纯规则)+ `agents/reviser.py`(首轮生成复用同一链路,只多传 feedback)。**正常请求 `planner→critic` 不触发修订;低预算请求 `planner→critic→reviser→critic`** |
 | Step 8 Reviser 主动改行程 | ✅ 已完成 (2026-09-23) | `revise` 分支接上;reviser 一个节点吃两种触发(critic 的 issues / 用户指令),靠 `intent` 区分。「没行程就想改」的守卫从 supervisor 挪到 reviser |
-| Step 9 收尾 | ⬜ 未开始 | |
+| Step 9 收尾 | ✅ 已完成 (2026-09-23) | 天气按天注入生成 prompt(真实预报,雨天已实测挪到室内);`ARCHITECTURE.md` 第 4/7 节同步;`intent` 透到 Java `ChatTurnResponse` + 前端气泡小标签;表单式 `/generate` 回归通过。**顺带修掉一个真 bug:给了具体出发日时被丢掉** |
 
 ### 实施中的偏离记录
 
@@ -34,6 +34,8 @@
 - **Step 6 的 confirm 路径不进图**:原计划写的是"confirm 路径也进图",实现时改成直接调 `planner_node`。理由:点按钮没有新消息,supervisor 对空消息会判成 `collect`、把 `status` 打回 `collecting`,confirm 就废了。走同一份节点代码,行为一致,还省一次 LLM 分类调用。
 - **Step 6 把护栏从 chat.py 搬进 `planner_node`**:参数齐否、预算过低这两道判断原来只在 chat.py 的 confirm 分支里。搬进来之后「对话里说生成」和「点按钮」共用一份,不会两边改歪;副作用是**对话路径现在也会被预算护栏拦住**(原计划没提,属预期内的收紧)。
 - **Step 5b 没做 `state["weather"]` 缓存**:原计划把预报写进该字段给 planner 复用,但天气改走工具后节点手里没有"这次查的是哪个城市"的确切记录(城市由模型定,可能一次查多个)。与其加一层 last-fetch 全局态,不如让 Step 9 的 planner 直接调 `fetch_forecast(destination)`(实测 0.4s,确定性,不依赖模型)。`ChatState.weather` 字段暂留空,Step 9 再定去留。
+- **Step 9 天气注入改走参数而不是 `state["weather"]`(定案)**:沿用上一条的结论 —— `_gen_weather_note(req)` 确定性取数,`weather_note` 作为 `generate_trip_plan` 的第四个入参。**`ChatState.weather` 字段就此废弃、一直留空**,不要再往里写。好处是缓存键可以显式带上 `weather_note`(否则改版会命中旧缓存),而且 planner 和 reviser 共用 `generate_plan`,不会出现"初版看天气、改版不看"。
+- **Step 9 把生效窗口从 5 天改成 3 天**:原写 5 天是拍脑袋。用真 key 实测高德 `weatherInfo?extensions=all` **只回 4 条 casts(今天 + 未来 3 天)**,起始日在 today+4/today+5 时预报一天都盖不到行程上,注入等于给模型塞无关天气。改成 3 天后边界实测正确(+0~+3 注入,+4 跳过)。
 
 ### 已发现的既有问题(非本次改造引入,待处理)
 
@@ -346,11 +348,51 @@ ai-service/app/
   1. **`status` 被兜底成 `collecting`**:用户主动改这条路是 `supervisor → reviser`,**没有 planner 走过**,而 `status` 一直是 planner 写的 —— 没人写就一路默认成 collecting,前端不会打开行程页。Step 7 那条没暴露是因为上游 planner 已经写过 `generated`,把问题盖住了。现由 reviser 自己写 `status/ready`。
   2. **"没行程就想改"的话术是错的**:守卫按计划放在 supervisor,只能降级成 chitchat,而 chitchat 会顺着用户的话答「好的,第 2 天全安排室内」—— **像是答应了改一份并不存在的行程**。守卫挪进 `reviser_node`,由它回正确的话。
 
-### Step 9 · 收尾
-- 天气影响安排:Planner 的 prompt 里,若 `state["weather"]` 有预报,按天注入(雨天提示室内、高温提示避开正午)
-- `docs/ARCHITECTURE.md` 第 4 节目录结构同步为本方案;本文件标记完成情况
-- 可选:前端展示 `intent`(气泡小标签「天气专家」),或 Java `ChatTurnResponse` 加 `intent` 字段
-- 回归:表单式生成链路(`/generate`)**全程未被触碰**,确认一次
+### Step 9 · 收尾 ✅ 已完成 (2026-09-23)
+
+**1. 天气影响安排(真实预报注入生成 prompt)**
+
+原计划依赖 `state["weather"]`,但 Step 5b 已把天气改成工具调用、该字段始终为空(见偏离记录)。实际做法:planner 在拼请求时**确定性调一次** `fetch_forecast(destination)`,拼成 `weather_note` 传给 `generate_trip_plan`。
+
+| 环节 | 位置 | 验证结果 |
+|---|---|---|
+| 取数 | `planner._gen_weather_note` → `fetch_forecast` | 真实 key 返回大理 4 天预报,单次 ~0.22s |
+| 生效窗口 | `_WEATHER_HORIZON_DAYS = 3` | 起始日 +0/+1/+2/+3 → 注入;+4/+30 → 跳过(高德 `extensions=all` 只回 4 天,超出则一天都盖不到) |
+| 进 prompt | `llm._build_prompt(weather_note=...)` | prompt 里出现「=== 目的地天气预报(真实数据) ===」段;不传时无此段 |
+| 进缓存键 | `llm._cache_key(weather_note=...)` | 带/不带 weather_note 的键不同(否则改版会命中旧缓存、返回没看天气的那版) |
+| 端到端 | `generate_plan`(起 09-23,当天小雨) | 模型把 D1 排成「抵达大理·雨天古城慢逛」（古城商铺/五华楼/人民路,可随时进店避雨),note 明写「因 23 日白天有小雨,骑行洱海廊道统一挪到 24 日」;D2 多云才排洱海廊道骑行;tips 提示带伞 |
+
+**2. `docs/ARCHITECTURE.md` 同步**:第 4 节目录结构改为多 Agent 布局;第 7 节「对话式」数据流改为真实的 supervisor + 7 条分支,并注明**当前是同步 REST、不是 SSE**(SSE 仍是演进方向)。
+
+**3. `intent` 透传(可选项目)**:Java `ChatTurnResponse` 加 `intent` 字段 → `ChatAiClient` 读 → `ChatService` 透传;前端 `ChatTurnResponse` 类型加 `intent`,AI 气泡显示小标签(闲聊/信息收集/攻略专家/天气专家/预算专家/行程生成/行程修订)。
+
+全链路实测(真实 JWT → Java 8080 → Python 8100):
+
+| 用户说 | Java 回的 intent | 期望 | 用时 |
+|---|---|---|---|
+| 你好呀 | chitchat | chitchat | 1.8s |
+| 大理有什么好吃的 | guide | guide | 3.6s |
+| 大理明天天气怎么样 | weather | weather | 3.0s |
+| 3000块够吗 | budget | budget | 2.6s |
+| 从上海出发去大理,10月1号到10月5号,2个人 | collect | collect | 48.4s |
+
+**5/5 命中**。注意最后一条 48.4s:这轮触发了 `estimate_min_total` 冷启动(见下方既有问题),不是路由本身慢。
+
+**4. `/generate` 回归**:上海→大理 10-01~10-05、2 人、预算 8000,返回 5 天行程、日期正确、`estimated_budget` 8000,耗时 45.5s。该路径直接调 `generate_trip_plan(req)`,`rag_context`/`weather_note`/`feedback` 全走默认 `None`,与改造前一致 —— **表单式不注入天气是有意的**(表单没有对话上下文,且日期常超出预报窗口)。
+
+**5. 顺带修掉一个真 bug(用户可见)**
+
+`build_request` 原来这样分支:`if start and end … elif total_days >= 1 … else raise`。但「10月1号出发,玩5天」这种说法抽出来是 **`start_date` + `total_days`、没有 `end_date`**(`missing_params` 也认它时间齐了),于是掉进 `total_days` 分支 —— **用户给的出发日被直接换成今天**,10 月 1 号的行程从今天排起。天气窗口判断也因此永远落在"今天"。
+修法:把 `elif start:` 提到 `total_days` 前面,有出发日就按天数往后推。三种说法实测:
+
+| 用户说法 | 抽取到的字段 | 解析出的起止日 |
+|---|---|---|
+| 10月1号出发,玩5天 | `start_date` + `total_days` | 2026-10-01 ~ 2026-10-05 |
+| 10月1日到10月5日 | `start_date` + `end_date` | 2026-10-01 ~ 2026-10-05 |
+| 玩5天 | `total_days` | 2026-09-23 ~ 2026-09-27(今天起,符合原设计) |
+
+**6. 环境依赖(部署须知)**:`/internal/weather` 需要 `AMAP_API_KEY`(高德**Web 服务**类型的 key,不是前端那个 JS API key)。没配时后端返回 502「天气服务未配置」,Python 侧 `fetch_forecast` 返回 `None` → `weather_note` 为空 → **照常生成行程,只是不看天气**(降级行为正确)。
+实测还发现:该 key 的档位有并发/QPS 上限,**无间隔连打第 4 次起必返回 `CUQPS_HAS_EXCEEDED_THE_LIMIT`**,约 1s 后自动恢复。真实使用一轮只查一次,不受影响;但在同一轮里连问多个城市的天气时,第二次可能拿到"没查到"。**未加自动重试**(属新范围,留给用户定)。
 
 ## 7. Java / 前端改动清单(汇总)
 
@@ -358,8 +400,11 @@ ai-service/app/
 |---|---|---|
 | `InternalWeatherController.java` | 新建,`/internal/weather`,校验 `X-AI-Service-Key` | S5 |
 | `application.properties` | 加 `app.ai.service-key` | S5 |
-| `ChatTurnResponse.java` | 可选,加 `intent` | S9 |
-| `ChatPanel.vue` | 可选,展示专家标签 | S9 |
+| `ChatTurnResponse.java` | 加 `intent` 字段(record 末位;两个便捷构造补 null) | S9 |
+| `ChatAiClient.java` | 读 `intent` 传进响应 | S9 |
+| `ChatService.java` | 落库那轮把 `resp.intent()` 一起透传 | S9 |
+| `ChatPanel.vue` | AI 气泡加意图小标签(`INTENT_LABEL` 映射);未识别的意图不显示 | S9 |
+| `frontend/src/types/index.ts` | `ChatTurnResponse` 加 `intent?: string \| null` | S9 |
 | 其余 | **无改动**(Reviser 复用 `createFromPlan`) | — |
 
 ## 8. 成本与延迟预算
