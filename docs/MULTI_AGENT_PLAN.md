@@ -14,7 +14,9 @@
 | Step 3a RAG 工具化 | ✅ 已完成 (2026-09-22) | `tools/rag_tool.py` 两个工具 + `rag/retrieve.py` 熔断。Milvus 挂时 11.04s → 0.00s |
 | Step 3b Retriever 专家 | ✅ 已完成 (2026-09-22) | `agents/retriever.py`(function calling 循环)+ `agents/base.py`(第二个消费者出现,公共件才抽)+ 接上 `guide` 分支。**话术集 15/15,攻略回复带真实资料** |
 | Step 4 Budget 专家 | ✅ 已完成 (2026-09-22) | `agents/budget.py` 加 `budget_node` + `block_state`(护栏口径统一);接上 `budget` 分支 |
-| Step 5 ~ Step 9 | ⬜ 未开始 | |
+| Step 5a Java 内部天气接口 | ✅ 已完成 (2026-09-23) | `InternalWeatherController` + `app.ai.service-key`。真 key 实测返回大理 4 天预报(0.51s) |
+| Step 5b Weather 专家 | ⬜ 未开始 | |
+| Step 6 ~ Step 9 | ⬜ 未开始 | |
 
 ### 实施中的偏离记录
 
@@ -194,13 +196,33 @@ ai-service/app/
 - **口径一致**:`bud-2`「我们从北京出发」被 supervisor 判成 `collect` 走了 chitchat,但 chitchat 的护栏给出 `min_budget=4500`,与 budget 路由给的值完全相同
 - 无回归:预算充足(`reg-a`,8000)仍是 `await_confirm` 不被误拦;攻略路由(`reg-b`)仍 `supervisor→retriever` 且带真实菜品
 
-### Step 5 · Weather 专家(唯一跨服务改动)
+### Step 5 · Weather 专家(唯一跨服务改动)🔶 已拆成 5a / 5b
+
+**5a · Java 内部天气接口 ✅ 已完成**
 - 后端新建 `InternalWeatherController`(`GET /internal/weather?city=`,校验 `X-AI-Service-Key`,不要求登录)
-- 后端改 `application.properties`:`app.ai.service-key=${AI_SERVICE_KEY:...}`
+- 后端改 `application.properties`:`app.ai.service-key=${AI_SERVICE_KEY:zhilv-internal-dev-key}`
+- 注意:`/internal/**` 不在 `/api/**` 下,`SecurityConfig` 的 `anyRequest().permitAll()` 已放行,鉴权在 Controller 内做
+
+实际做法与验证:
+- **没动 `SecurityConfig`**:`/internal/weather` 落进 `anyRequest().permitAll()`,校验改由 Controller 自己做(放行≠不鉴权,只是换鉴权方式)。已在 Controller 注释里写明。
+- **复用了现有的 `AmapWeatherService`**:它已经能"城市名 → adcode → 逐日预报",内部接口只是薄薄一层转发 + 换鉴权,没重写高德调用。
+- **共享密钥给了开发默认值**(与 `app.jwt.secret` 同款):本地零配置可跑,生产必须用 `AI_SERVICE_KEY` 覆盖。Python 侧将用同名默认值,两边不配也能对上。
+- 验证(后端带真实 `AMAP_API_KEY` 启动,key 只作进程环境变量,未落任何文件):
+
+| 用例 | 结果 |
+|---|---|
+| 不带 `X-AI-Service-Key` | 401 `内部接口校验失败` |
+| key 不对 | 401 `内部接口校验失败` |
+| key 正确 `?city=大理` | 200,真实预报:大理市/云南/532901,4 天(小雨→多云) |
+| key 正确但不给 city | 400 `城市不能为空` |
+| 原有 `/api/weather/forecast` | 仍 401 要登录(无回归) |
+
+- **顺带发现(既有行为,非本次引入)**:高德地理编码对不存在的地名不报错,而是匹配到别处(实测 `???xyz` 返回了「兴庆区/宁夏」)。即目的地是编造的地名时,天气会静默串到别的城市。weather Agent 的 prompt 里要提醒"资料与目的地不符就别报"。
+
+**5b · Python 侧 Weather 专家 ⬜ 未开始**
 - 新建 `app/tools/weather_tool.py`(调 Java)、`app/agents/weather.py`;查到的预报写进 `state["weather"]` 缓存
 - 改 `app/graph/builder.py`:接上 `weather` 分支;`app/config.py` 加 `JAVA_BASE_URL` / `AI_SERVICE_KEY`
-- 验证:`curl -H "X-AI-Service-Key: xxx" "localhost:8080/internal/weather?city=大理"` 返回预报;说「大理明天天气怎么样」→ `intent=weather`;把 Java 停掉再问 → 回复降级为「暂时查不到天气」,**不报错**
-- 注意:`/internal/**` 不在 `/api/**` 下,`SecurityConfig` 的 `anyRequest().permitAll()` 已放行,鉴权在 Controller 内做
+- 验证:说「大理明天天气怎么样」→ `intent=weather`,回复带真实预报;把 Java 停掉再问 → 回复降级为「暂时查不到天气」,**不报错**
 
 ### Step 6 · Planner 专家 + 生成回流到图
 - 新建 `app/agents/planner.py`:包 `generate_trip_plan`,产出写进 `state["plan"]`(Reviser 后续要用)
