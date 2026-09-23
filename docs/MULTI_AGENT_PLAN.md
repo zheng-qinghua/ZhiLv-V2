@@ -17,7 +17,8 @@
 | Step 5a Java 内部天气接口 | ✅ 已完成 (2026-09-23) | `InternalWeatherController` + `app.ai.service-key`。真 key 实测返回大理 4 天预报(0.51s) |
 | Step 5b Weather 专家 | ✅ 已完成 (2026-09-23) | `tools/weather_tool.py` + `agents/weather.py`;工具循环提到 `base.tool_loop`。**话术集 15/15,回复带真实预报且日期算对(今天/明天/后天)** |
 | 插队:Redis 可靠性修复 | ✅ 已完成 (2026-09-23) | 见下方"既有问题"第 2 条。Redis 挂时每轮 95s → ~2s,且停机期间对话不再丢 |
-| Step 6 ~ Step 9 | ⬜ 未开始 | |
+| Step 6 Planner 专家 | ✅ 已完成 (2026-09-23) | `agents/planner.py`(生成逻辑从 chat.py 上移)+ 接上 `plan` 分支;confirm 路径改为直接调 planner 节点。**话术集 15/15,两条生成入口的字段与话术完全一致** |
+| Step 7 ~ Step 9 | ⬜ 未开始 | |
 
 ### 实施中的偏离记录
 
@@ -26,6 +27,8 @@
 - **`agents/budget.py` 提前到 Step 2a**:chitchat 要用 `low_block`,而 chitchat 被图引用,不能再反向 import 入口 `chat.py`,否则循环依赖。所以预算模块必须先独立;Step 4 只剩「接分支 + 做成独立节点」。
 - **Step 5b 从「直接查 params.destination」改成 function calling**:实测 supervisor 对天气问句的目的地抽取不稳(「大理明天天气怎么样」4 次里 1 次抽不到 → 节点不知道该查哪个城市,只能回「查不到」)。改由模型读对话定城市后,构造「params 为空 + 话里有城市名」的用例连测 3 次全部答对。代价是多一轮 LLM(~1.5s),换来的是抽取抖动不再影响可用性。
 - **`base.tool_loop` 提到公共处**:retriever 和 weather 各要一份工具循环(第二个消费者出现),所以按既有约定上移;retriever 自身删掉本地循环,行为不变(tw-3 复测仍带真实菜品)。
+- **Step 6 的 confirm 路径不进图**:原计划写的是"confirm 路径也进图",实现时改成直接调 `planner_node`。理由:点按钮没有新消息,supervisor 对空消息会判成 `collect`、把 `status` 打回 `collecting`,confirm 就废了。走同一份节点代码,行为一致,还省一次 LLM 分类调用。
+- **Step 6 把护栏从 chat.py 搬进 `planner_node`**:参数齐否、预算过低这两道判断原来只在 chat.py 的 confirm 分支里。搬进来之后「对话里说生成」和「点按钮」共用一份,不会两边改歪;副作用是**对话路径现在也会被预算护栏拦住**(原计划没提,属预期内的收紧)。
 - **Step 5b 没做 `state["weather"]` 缓存**:原计划把预报写进该字段给 planner 复用,但天气改走工具后节点手里没有"这次查的是哪个城市"的确切记录(城市由模型定,可能一次查多个)。与其加一层 last-fetch 全局态,不如让 Step 9 的 planner 直接调 `fetch_forecast(destination)`(实测 0.4s,确定性,不依赖模型)。`ChatState.weather` 字段暂留空,Step 9 再定去留。
 
 ### 已发现的既有问题(非本次改造引入,待处理)
@@ -251,12 +254,35 @@ ai-service/app/
 
 - 耗时参考(Redis 正常时):weather ~3~5s、retriever ~3~4s、chitchat ~1.6s、budget 冷启动 ~25s(估算缓存)。
 
-### Step 6 · Planner 专家 + 生成回流到图
+### Step 6 · Planner 专家 + 生成回流到图 ✅ 已完成 (2026-09-23)
+
+原计划:
 - 新建 `app/agents/planner.py`:包 `generate_trip_plan`,产出写进 `state["plan"]`(Reviser 后续要用)
 - 改 `app/graph/builder.py`:接上 `plan` 分支;confirm 路径也进图
 - 改 `app/chat.py`:confirm 分支改为「跑图 → 取 `state["plan"]`」
-- 验证:对话信息齐后说「帮我生成行程」→ 直接 `status=generated`(不再必须点按钮);点按钮仍能生成
-- 收益:生成的行程第一次进入会话状态,才可能做 Step 7/8
+
+实际做法:
+- **`_generate_from_params` / `_gen_rag_context` 从 `chat.py` 上移到 `agents/planner.py`**(仍为模块私有)。和 Step 2a 挪 `budget.py` 同一个理由:planner 节点要被 `graph/builder.py` 引用,而 `chat.py` 引用 builder —— 生成逻辑留在 chat 里就会循环 import。**这也是本项目第二次用「第二个消费者出现才上移」这条惯例。**
+- **护栏(参数齐否 + 预算过低)从 chat.py 的 confirm 分支搬进 `planner_node`**:两条入口共用一份判断,不再有两处可能改歪。chat.py 的 confirm 分支只剩"调节点 → 组装响应 → 写回状态"。
+- **confirm 没进图,而是直接调 `planner_node`**(偏离原计划"跑图"),原因:点按钮时没有新消息可喂 supervisor,让它对空消息分类会把 `intent` 判成 collect、把 `status` 打回 collecting,confirm 直接失效。走同一个节点函数反而更稳,`agent_trace=['planner']` 也如实反映"只过了 planner"。
+- **`build_graph` 的 `plan` 分支只挂 `planner → END`**:Step 7 会在中间插 critic,现在不做预留。
+- **顺手补的两个 bug**(验证时暴露):
+  1. 图的 `plan` 分支跑通后,`handle_turn` 的返回里**没带 `plan` 字段** —— 只有 confirm 分支带了。表现是 `status=generated` 但前端拿不到行程。已补。
+  2. `state["plan"]` **没进 Redis**(两处 `_save_state` 都只写 messages/params/insisted_sig)。这样下一轮 reviser 手里没有行程,Step 8 会直接做不成。已在两处写入 `plan`,并复测 Redis 里确实有。
+
+验证结果:
+
+| 用例 | 结果 |
+|---|---|
+| 对话信息齐后说「帮我生成行程」 | `intent=plan`、`agent_trace=['supervisor','planner']`、`status=generated`,plan 标题「上海出发·大理苍山洱海5日舒适之旅」,days=5 |
+| 点「确认行程」按钮(无消息) | `agent_trace=['planner']`、`status=generated`,46.1s;**与对话路径的 reply 文案、返回字段逐项一致** |
+| 信息不全时点确认 | **0.0s**、`status=collecting`、回复「还缺关键信息…还差:出发地、目的地、出行时间」,**未调 LLM** |
+| 预算过低时走「帮我生成行程」 | 1.2s、`status=budget_low`、`min_budget=4200`,**与点确认的拦截口径一致**(原来只有 confirm 会拦) |
+| 接受「就按最省的吧」后再生成 | 护栏放行 → `status=generated`;随后点确认 **0.1s**(命中 LLM 结果缓存) |
+| `state["plan"]` 落 Redis | ✅ `zhilv:chat:s6-b` 的 state keys = `insisted_sig/messages/params/plan`,plan 4 天完整 |
+| 话术集(回归) | **15/15**,「帮我生成行程吧」在参数不全时正确回落 collect→chitchat |
+
+- 耗时参考:planner 生成一轮 46~71s(生成 5 天行程本身就要这么多,Redis/图编排只占 ~0.1s);confirm 命中缓存时 0.1s。
 
 ### Step 7 · Critic + 修订环
 - 新建 `app/agents/critic.py`(规则校验:天数、每天 city 非省级、总花费 vs 预算 ±10%、各天 hotel 之和 vs `budget_breakdown.hotel` ±20%、饮食偏好是否落进 `meals.notes`、节奏与每天景点数匹配) + `app/agents/reviser.py`(把 `issues` 回灌给模型重排,最多 1 轮)
