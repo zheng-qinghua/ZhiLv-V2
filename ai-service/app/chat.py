@@ -18,9 +18,8 @@ import json
 
 import redis as redis_lib
 
-from app.agents.planner import planner_node
 from app.config import REDIS_HOST, REDIS_PORT, REDIS_SOCKET_TIMEOUT_SECONDS
-from app.graph.builder import GRAPH
+from app.graph.builder import GENERATE_GRAPH, GRAPH
 
 _REDIS_PREFIX = "zhilv:chat:"
 
@@ -97,9 +96,10 @@ def handle_turn(thread_id: str, message: str = "", action: str = "chat") -> dict
     confirm = bool(action and action.strip().lower() == "confirm")
     text = (message or "").strip()
     if confirm or not text:
-        # 点「确认行程」时没有新消息可以给 supervisor 分类,所以不进图、直接叫 planner 专家 ——
-        # 和「帮我生成行程」走的是同一个 planner_node,门槛/话术/返回字段天然一致。
-        out = planner_node(state)
+        # 点「确认行程」时没有新消息可以给 supervisor 分类,所以不进 GRAPH、走 GENERATE_GRAPH
+        # (planner → critic → reviser,复用同一批节点)。和「帮我生成行程」的质量门槛一致:
+        # 前者只是少了 supervisor 那一跳。
+        out = GENERATE_GRAPH.invoke(state)
         result = {
             "reply": out.get("reply") or "行程暂时生成不出来,稍后再让我试一次?",
             "status": out.get("status", "collecting"),

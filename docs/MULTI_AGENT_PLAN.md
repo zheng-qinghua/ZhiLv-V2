@@ -18,7 +18,8 @@
 | Step 5b Weather 专家 | ✅ 已完成 (2026-09-23) | `tools/weather_tool.py` + `agents/weather.py`;工具循环提到 `base.tool_loop`。**话术集 15/15,回复带真实预报且日期算对(今天/明天/后天)** |
 | 插队:Redis 可靠性修复 | ✅ 已完成 (2026-09-23) | 见下方"既有问题"第 2 条。Redis 挂时每轮 95s → ~2s,且停机期间对话不再丢 |
 | Step 6 Planner 专家 | ✅ 已完成 (2026-09-23) | `agents/planner.py`(生成逻辑从 chat.py 上移)+ 接上 `plan` 分支;confirm 路径改为直接调 planner 节点。**话术集 15/15,两条生成入口的字段与话术完全一致** |
-| Step 7 ~ Step 9 | ⬜ 未开始 | |
+| Step 7 Critic + 修订环 | ✅ 已完成 (2026-09-23) | `agents/critic.py`(8 条纯规则)+ `agents/reviser.py`(首轮生成复用同一链路,只多传 feedback)。**正常请求 `planner→critic` 不触发修订;低预算请求 `planner→critic→reviser→critic`** |
+| Step 8 ~ Step 9 | ⬜ 未开始 | |
 
 ### 实施中的偏离记录
 
@@ -27,6 +28,7 @@
 - **`agents/budget.py` 提前到 Step 2a**:chitchat 要用 `low_block`,而 chitchat 被图引用,不能再反向 import 入口 `chat.py`,否则循环依赖。所以预算模块必须先独立;Step 4 只剩「接分支 + 做成独立节点」。
 - **Step 5b 从「直接查 params.destination」改成 function calling**:实测 supervisor 对天气问句的目的地抽取不稳(「大理明天天气怎么样」4 次里 1 次抽不到 → 节点不知道该查哪个城市,只能回「查不到」)。改由模型读对话定城市后,构造「params 为空 + 话里有城市名」的用例连测 3 次全部答对。代价是多一轮 LLM(~1.5s),换来的是抽取抖动不再影响可用性。
 - **`base.tool_loop` 提到公共处**:retriever 和 weather 各要一份工具循环(第二个消费者出现),所以按既有约定上移;retriever 自身删掉本地循环,行为不变(tw-3 复测仍带真实菜品)。
+- **Step 7 新增 `GENERATE_GRAPH`(生成专用图)**:Step 6 让 confirm 直接调 `planner_node`,Step 7 一加 critic 就暴露了问题 —— **点按钮绕开 supervisor 的同时把质检也绕开了**,同一个请求会因入口不同产出不同质量的行程。改法是再加一张只含 `planner→critic→reviser` 的图,和主图**共用节点函数与 `should_revise` 判断**,重复的只有 4 行接线、没有重复的逻辑。(没选"让 supervisor 对空消息放行"那种写法:那等于让路由器在一个分支上说谎。)
 - **Step 6 的 confirm 路径不进图**:原计划写的是"confirm 路径也进图",实现时改成直接调 `planner_node`。理由:点按钮没有新消息,supervisor 对空消息会判成 `collect`、把 `status` 打回 `collecting`,confirm 就废了。走同一份节点代码,行为一致,还省一次 LLM 分类调用。
 - **Step 6 把护栏从 chat.py 搬进 `planner_node`**:参数齐否、预算过低这两道判断原来只在 chat.py 的 confirm 分支里。搬进来之后「对话里说生成」和「点按钮」共用一份,不会两边改歪;副作用是**对话路径现在也会被预算护栏拦住**(原计划没提,属预期内的收紧)。
 - **Step 5b 没做 `state["weather"]` 缓存**:原计划把预报写进该字段给 planner 复用,但天气改走工具后节点手里没有"这次查的是哪个城市"的确切记录(城市由模型定,可能一次查多个)。与其加一层 last-fetch 全局态,不如让 Step 9 的 planner 直接调 `fetch_forecast(destination)`(实测 0.4s,确定性,不依赖模型)。`ChatState.weather` 字段暂留空,Step 9 再定去留。
@@ -39,6 +41,9 @@
   2. **`localhost` 会先试 IPv6(::1) 再试 IPv4**:两次各等满一个 connect timeout,所以每次 op 的实际代价是"超时 × 2"。默认超时从 2s 降到 `REDIS_SOCKET_TIMEOUT_SECONDS=0.5`。
   合起来:`_load_state`/`_save_state` 各一次读写 → 每轮 ~2s(原 ~95s)。client 也改为复用(原来每轮新建连接)。
   顺带修掉一个**测出来的真 bug**:历史只存在 Redis 里,Redis 一挂「读不到 → 当成新会话」,**停机当轮就把对话清空了**(实测第 3 轮反过来问用户刚给过的出发地)。现加进程内镜像 `_STATE` + 脏标记 `_DIRTY`:写 Redis 失败就标脏,读时优先本地,Redis 恢复后下一轮自动写回并清标记。端到端复测:停机前 2 轮正常 → 停机后第 3/4 轮对话继续、params 不丢 → Redis 恢复后 `zhilv:chat:e2e-x` 里 10 条消息 + 完整 params 全在,回同步成功。
+- **话术集命中率本身是抖的(12~15/15),别把单次 15/15 当成回归基线**:Step 7 改完复测,同代码连跑三次得到 15→14→13→12 中不同的组合,**每次挂的话术都不一样**。原因在 `supervisor_node` 那次 LLM 分类(`temperature=0.3`),不在路由代码 —— 已用 git 确认 `supervisor.py` / `graph/params.py` 在 Step 6/7 全程未被改动。
+  最常挂的两条是「就按最省的安排吧」「帮我生成行程吧」(在没有任何参数时)。注意 `_apply_guards` 会把"没有行程时的 `revise`"降级成 `chitchat`,所以模型把「按最省的安排」读成"改行程"时会落到 chitchat,而 probe 期望 `collect` —— 这条期望值本身也偏严。
+  想稳住的话有两条路(都未做,留用户定):给 supervisor 单独降到 `temperature=0`;或把 probe 的话术期望改宽(plan/revise/collect 在无参数时都算过)。
 - **验证环境提示**:probe 的耗时读数只有在 Redis、Milvus 都起来时才有意义;否则量到的是重试退避而不是业务耗时。
 - **`estimate_min_total` 冷启动约 26~30 秒**(既有行为,Step 4 暴露出来):模型对这条估算 prompt 会先输出一大段看不见的推理,再吐 18 个字符的 JSON(实测 25.7s 出 `{"min_total":1800}`)。按路线缓存 6h,所以**同一路线只慢第一次**,之后 0.00s。Step 4 之后 budget 路由在「回答够不够」时就会触发这个冷启动,比改造前(只在确认护栏时触发)更容易被用户撞上。可选修法:估算结果落 Redis 跨进程复用 / 换更快的估算方式 / 接受 6h 一次。**属设计取舍,留给用户定。**
 
@@ -284,10 +289,35 @@ ai-service/app/
 
 - 耗时参考:planner 生成一轮 46~71s(生成 5 天行程本身就要这么多,Redis/图编排只占 ~0.1s);confirm 命中缓存时 0.1s。
 
-### Step 7 · Critic + 修订环
+### Step 7 · Critic + 修订环 ✅ 已完成 (2026-09-23)
+
+原计划:
 - 新建 `app/agents/critic.py`(规则校验:天数、每天 city 非省级、总花费 vs 预算 ±10%、各天 hotel 之和 vs `budget_breakdown.hotel` ±20%、饮食偏好是否落进 `meals.notes`、节奏与每天景点数匹配) + `app/agents/reviser.py`(把 `issues` 回灌给模型重排,最多 1 轮)
 - 改 `app/graph/builder.py`:`planner → critic →(pass)END /(fail)reviser → critic`,用 `revision_round` 封顶
-- 验证:故意给一个「预算 800 去大理 5 天」的请求,`probe` 打印 `agent_trace=planner→critic→reviser→critic`,最终 plan 的日均花费明显下降;正常请求 `agent_trace=planner→critic` 且不触发 Reviser
+
+实际做法(critic 是**纯规则、不调模型**;reviser 复用首轮那条生成链路):
+- **"总花费 vs 预算 ±10%"这条按原样写会永远不触发**:实测模型会把 `estimated_budget` 直接写成和 `budget` 一模一样(预算 600 → 预估也写 600)、`budget_breakdown` 四项之和也凑成 600。改成两条能真正触发的:
+  - **总花费 vs 路线最低估算**(复用 `budget.estimate_min_total`,护栏那步已算过并缓存 6h,这里通常 0 秒):低于最低估算的 80% 判"这个价钱排不出能走的行程"。
+  - **总花费 vs 预算 +10%**:模型无视预算硬排高档行程时抓它。
+  - 两条**互斥**:用户预算本身就低于最低估算时(600 元玩大理 5 天),模型只有"编低价"和"照现实写"两条路,后者不该被骂 —— 所以那种情况只保留"花太少"那条,否则两条相反的意见会把模型来回拉扯,改出来更差。
+- **reviser 从 `params` 重建 TripRequest,不改手里的 plan**:`hotel_level` 和 `dietary_preferences` 不在 TripPlan 契约里,从 plan 反推会丢,而丢的正好是 critic 要审的两项。为此把 planner 里的请求构建提成公开的 `planner.build_request`(第三个消费者:planner / critic 的对照 / reviser)。
+- **reviser 没另写 prompt**:`llm.generate_trip_plan` 里本来就有"上次未通过校验"那段(原本给 JSON 解析失败重试用),新加一个 `feedback` 参数灌 issues 就够,字段口径和初版天然一致。**`feedback` 必须进缓存 key**,否则"按质检意见重排"会命中原始那版缓存、原样返回没改过的行程。
+- **planner 的三条"没生成"出口(参数不全/预算护栏/生成失败)显式写 `plan: None`**:否则上一轮的旧行程会留给 critic 去审,用户这轮只是补参数,却可能触发一次莫名其妙的"重排"。旧行程在 Redis 里仍在(chat 写回用 `out["plan"] or state["plan"]`)。
+- **新增 `GENERATE_GRAPH`(见偏离记录)**:点「确认行程」也要过 critic,不能因为绕开 supervisor 就连质检一起绕开。
+
+验证结果:
+
+| 用例 | 结果 |
+|---|---|
+| 正常请求(8000 元/大理 5 天/2 人)对话生成 | `agent_trace=['supervisor','planner','critic']`,**未触发 reviser** |
+| 正常请求点「确认行程」 | `['planner','critic']` —— 确认路径现在也有质检(改之前只有 planner) |
+| 低预算(600 元/大理 5 天/3 人)对话生成 | **`['supervisor','planner','critic','reviser','critic']`** ← 文档要的那条,152.8s |
+| 修订后的 plan | 由"凑成 600 的假行程"变成 8430 元的现实行程,tips 明写「600元预算远不足以覆盖上海—大理往返大交通和5晚舒适型住宿,建议至少准备约8400元/3人」——正是 feedback 里要求的"如实排 + 说明够不够" |
+| 规则单元测试 | 省级 city / 排 7 个景点 / 某天 0 景点 / 住宿明细对不上 / day_index 不连续 / 饮食偏好没落地 —— 6 种注入缺陷全部报出;正常 plan 无 issue |
+| 饮食偏好规则 | 修掉一个自造 bug:`不吃辣` 剥掉前缀得到单字「辣」,被 `len(t)>=2` 过滤掉,导致这条规则永远判"没落地"。现 `不吃辣→{不吃辣,辣}`、`素食→{素食}`,两个方向都对 |
+| 修订环封顶 | reviser 自己 +1、`should_revise` 校验上限 1,`reviser→critic` 最多转一圈(上表那条 trace 已证明会停) |
+
+- ⚠️ **与文档预期不同的一点**:文档写的是"最终 plan 的日均花费明显下降"。按上面的重构,低预算场景下修订的效果是**花费上升**(从编造的 600 → 现实的 8430),因为"假"的那一版本来就是靠编低价凑出来的。哪种行为更合理请用户定:现在是"宁可真而贵,不假而省钱"。
 
 ### Step 8 · Reviser 专家(用户主动改行程)
 - 改 `app/agents/reviser.py`:支持「用户主动改」入口(读 `state["plan"]` + 用户指令),与 Step 7 的「按 issues 修」共用同一个模型调用
