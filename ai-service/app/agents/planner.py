@@ -40,8 +40,17 @@ def _gen_rag_context(dest: str) -> str:
         return ""
 
 
-def _generate_from_params(p: dict):
-    """把已确定参数解析成 TripRequest 并生成 TripPlan;缺关键项抛 RuntimeError。"""
+def build_request(p: dict) -> TripRequest:
+    """把已确定参数解析成 TripRequest;缺关键项抛 RuntimeError。
+
+    默认值规则(CLAUDE.md/M4):人数 3、节奏适中、住宿舒适型、偏好/备注留空;
+    预算用户给过就用他的(人均→×人数换算总额),没给才按 200×人数×天数估算;
+    只说"N天"没给具体起止日 → 出发日取今天。
+
+    公开出来是因为 reviser 也要用:重排必须拿**同一份**请求(尤其 hotel_level 和
+    dietary_preferences —— 它们不在 TripPlan 里,从 plan 反推会丢,而丢的正好是
+    critic 要审的那几项)。
+    """
     dep = str(p.get("departure") or "").strip()
     if not dep:
         raise RuntimeError("出发地还没确定,先在对话里告诉我从哪个城市出发")
@@ -70,7 +79,7 @@ def _generate_from_params(p: dict):
         # 没给预算时的粗略帽:每人每天 200 当地花费 + 800 往返大交通兜底(不判距离)
         budget_total = float((200 * day_count + 800) * travelers)
 
-    req = TripRequest(
+    return TripRequest(
         departure=dep,
         destination=dest,
         start_date=start_d.isoformat(),
@@ -83,7 +92,12 @@ def _generate_from_params(p: dict):
         dietary_preferences=[str(x).strip() for x in (p.get("dietary_preferences") or []) if str(x).strip()] or None,
         special_notes=str(p.get("special_notes") or "").strip() or None,
     )
-    return generate_trip_plan(req, rag_context=_gen_rag_context(dest))
+
+
+def _generate_from_params(p: dict):
+    """解析参数并生成 TripPlan(planner 节点用)。"""
+    req = build_request(p)
+    return generate_trip_plan(req, rag_context=_gen_rag_context(req.destination))
 
 
 def _collecting_reply(params: dict) -> str:
@@ -97,10 +111,13 @@ def planner_node(state: ChatState) -> dict:
     trace = base.trace(state, "planner")
     params = state.get("params") or {}
 
+    # 三条"没生成"的出口都要把 plan 显式清空:否则上一轮的旧行程会留给 critic 去审
+    # (用户这轮只是补参数,却可能触发一次莫名其妙的"重排")。旧行程在 Redis 里仍在,
+    # chat 写回时用的是 out["plan"] or state["plan"],不会丢。
     if not is_ready(params):
         reply = _collecting_reply(params)
         return {"reply": reply, "status": "collecting", "ready": False,
-                "messages": base.with_reply(state, reply), "agent_trace": trace}
+                "messages": base.with_reply(state, reply), "plan": None, "agent_trace": trace}
 
     # 预算过低且没接受"按最省":连"帮我生成行程"也按住,把提醒写回对话(下次生成时模型知道劝过)
     st = block_state(params, str(state.get("insisted_sig") or ""))
@@ -112,18 +129,18 @@ def planner_node(state: ChatState) -> dict:
             f"回复我「就按最省的吧」,我会按最省方式压缩排期。"
         )
         return {"reply": reply, "status": st["status"], "ready": st["ready"],
-                "messages": base.with_reply(state, reply), "params": params,
+                "messages": base.with_reply(state, reply), "params": params, "plan": None,
                 "low_budget": True, "min_budget": st["min_budget"], "agent_trace": trace}
 
     try:
         plan = _generate_from_params(params)
     except RuntimeError as exc:
         return {"reply": f"行程生成失败:{exc}", "status": "generation_failed",
-                "ready": True, "params": params, "agent_trace": trace}
+                "ready": True, "params": params, "plan": None, "agent_trace": trace}
     except Exception as exc:  # LLM 超时/输出解析失败等:降级成一句可读回复,不让对话 500
         return {"reply": f"行程生成失败:{type(exc).__name__}。稍后再让我试一次?",
                 "status": "generation_failed", "ready": True, "params": params,
-                "agent_trace": trace}
+                "plan": None, "agent_trace": trace}
 
     reply = "行程已按对话整理生成,正在为你打开。"
     return {"reply": reply, "status": "generated", "ready": True,

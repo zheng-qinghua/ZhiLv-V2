@@ -46,10 +46,13 @@ def _to_cost(v) -> float | None:
 _LLM_CACHE: dict[str, tuple[float, TripPlan]] = {}
 
 
-def _cache_key(req: TripRequest, rag_context: str = "") -> str:
+def _cache_key(req: TripRequest, rag_context: str = "", feedback: str = "") -> str:
     raw = json.dumps(req.model_dump(), sort_keys=True, ensure_ascii=False)
     if rag_context:
         raw += "\nRAG:" + rag_context
+    # feedback 必须进 key:否则「按质检意见重排」会命中原始那版缓存,原样返回没改过的行程
+    if feedback:
+        raw += "\nFB:" + feedback
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -299,20 +302,24 @@ def _normalize_plan(data: dict, req: TripRequest, day_count: int) -> dict:
 
 
 def generate_trip_plan(req: TripRequest, max_attempts: int | None = None,
-                       rag_context: str | None = None) -> TripPlan:
-    """调 DeepSeek 生成 TripPlan;重试后仍失败抛 RuntimeError(携带最近失败原因)。"""
+                       rag_context: str | None = None, feedback: str | None = None) -> TripPlan:
+    """调 DeepSeek 生成 TripPlan;重试后仍失败抛 RuntimeError(携带最近失败原因)。
+
+    feedback 是给 reviser 用的:把 critic 挑出来的问题灌进"上次未通过校验"那段,
+    让它带着意见重排。它进缓存 key,所以修过的那版不会命中原始那版。
+    """
     llm = build_chat_llm()
     if llm is None:
         raise RuntimeError("未配置 LLM_API_KEY,无法调用 DeepSeek")
 
-    key = _cache_key(req, rag_context or "")
+    key = _cache_key(req, rag_context or "", feedback or "")
     cached = _cache_get(key)
     if cached is not None:
         return cached
 
     attempts = max_attempts or (LLM_MAX_RETRIES + 1)
     day_count = (date.fromisoformat(req.end_date) - date.fromisoformat(req.start_date)).days + 1
-    correction: str | None = None
+    correction: str | None = feedback or None
 
     for attempt in range(1, attempts + 1):
         system_prompt, human_prompt = _build_prompt(req, day_count, correction, rag_context)
