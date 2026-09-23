@@ -19,7 +19,8 @@
 | 插队:Redis 可靠性修复 | ✅ 已完成 (2026-09-23) | 见下方"既有问题"第 2 条。Redis 挂时每轮 95s → ~2s,且停机期间对话不再丢 |
 | Step 6 Planner 专家 | ✅ 已完成 (2026-09-23) | `agents/planner.py`(生成逻辑从 chat.py 上移)+ 接上 `plan` 分支;confirm 路径改为直接调 planner 节点。**话术集 15/15,两条生成入口的字段与话术完全一致** |
 | Step 7 Critic + 修订环 | ✅ 已完成 (2026-09-23) | `agents/critic.py`(8 条纯规则)+ `agents/reviser.py`(首轮生成复用同一链路,只多传 feedback)。**正常请求 `planner→critic` 不触发修订;低预算请求 `planner→critic→reviser→critic`** |
-| Step 8 ~ Step 9 | ⬜ 未开始 | |
+| Step 8 Reviser 主动改行程 | ✅ 已完成 (2026-09-23) | `revise` 分支接上;reviser 一个节点吃两种触发(critic 的 issues / 用户指令),靠 `intent` 区分。「没行程就想改」的守卫从 supervisor 挪到 reviser |
+| Step 9 收尾 | ⬜ 未开始 | |
 
 ### 实施中的偏离记录
 
@@ -28,6 +29,7 @@
 - **`agents/budget.py` 提前到 Step 2a**:chitchat 要用 `low_block`,而 chitchat 被图引用,不能再反向 import 入口 `chat.py`,否则循环依赖。所以预算模块必须先独立;Step 4 只剩「接分支 + 做成独立节点」。
 - **Step 5b 从「直接查 params.destination」改成 function calling**:实测 supervisor 对天气问句的目的地抽取不稳(「大理明天天气怎么样」4 次里 1 次抽不到 → 节点不知道该查哪个城市,只能回「查不到」)。改由模型读对话定城市后,构造「params 为空 + 话里有城市名」的用例连测 3 次全部答对。代价是多一轮 LLM(~1.5s),换来的是抽取抖动不再影响可用性。
 - **`base.tool_loop` 提到公共处**:retriever 和 weather 各要一份工具循环(第二个消费者出现),所以按既有约定上移;retriever 自身删掉本地循环,行为不变(tw-3 复测仍带真实菜品)。
+- **Step 8 把「没行程就想改」的守卫从 supervisor 挪到 reviser**:原计划写在 supervisor。但 supervisor 是路由、不产出话术,它只能把 `revise` 降级成 `chitchat`,而 chitchat 会顺着用户的话答「好的,第 2 天全安排室内」——**像是答应了改一份不存在的行程**。守卫的目的本来就是"回一句正确的话",所以该放在会说话的那个节点里。
 - **Step 7 新增 `GENERATE_GRAPH`(生成专用图)**:Step 6 让 confirm 直接调 `planner_node`,Step 7 一加 critic 就暴露了问题 —— **点按钮绕开 supervisor 的同时把质检也绕开了**,同一个请求会因入口不同产出不同质量的行程。改法是再加一张只含 `planner→critic→reviser` 的图,和主图**共用节点函数与 `should_revise` 判断**,重复的只有 4 行接线、没有重复的逻辑。(没选"让 supervisor 对空消息放行"那种写法:那等于让路由器在一个分支上说谎。)
 - **Step 6 的 confirm 路径不进图**:原计划写的是"confirm 路径也进图",实现时改成直接调 `planner_node`。理由:点按钮没有新消息,supervisor 对空消息会判成 `collect`、把 `status` 打回 `collecting`,confirm 就废了。走同一份节点代码,行为一致,还省一次 LLM 分类调用。
 - **Step 6 把护栏从 chat.py 搬进 `planner_node`**:参数齐否、预算过低这两道判断原来只在 chat.py 的 confirm 分支里。搬进来之后「对话里说生成」和「点按钮」共用一份,不会两边改歪;副作用是**对话路径现在也会被预算护栏拦住**(原计划没提,属预期内的收紧)。
@@ -319,10 +321,30 @@ ai-service/app/
 
 - ⚠️ **与文档预期不同的一点**:文档写的是"最终 plan 的日均花费明显下降"。按上面的重构,低预算场景下修订的效果是**花费上升**(从编造的 600 → 现实的 8430),因为"假"的那一版本来就是靠编低价凑出来的。哪种行为更合理请用户定:现在是"宁可真而贵,不假而省钱"。
 
-### Step 8 · Reviser 专家(用户主动改行程)
+### Step 8 · Reviser 专家(用户主动改行程) ✅ 已完成 (2026-09-23)
+
+原计划:
 - 改 `app/agents/reviser.py`:支持「用户主动改」入口(读 `state["plan"]` + 用户指令),与 Step 7 的「按 issues 修」共用同一个模型调用
-- 改 `app/graph/builder.py` + `app/agents/supervisor.py`:接上 `revise` 分支,并在 supervisor 加守卫——`state["plan"]` 为空时把 `revise` 降级为 `chitchat`(回「先把行程生成出来我才能改」)
-- 验证:生成完行程后接着说「第 2 天别安排户外,换成室内的」→ `intent=revise`,`status=generated`,Java 落成**一条新行程**(旧的那条仍在历史里)
+- 改 `app/graph/builder.py` + `app/agents/supervisor.py`:接上 `revise` 分支 + 守卫
+
+实际做法:
+- **一个节点吃两种触发,靠 `intent` 区分**:`intent=="revise"` 是 supervisor 判出的用户主动改,否则是 critic 下游那条。两条都走 `generate_trip_plan` + `build_request`,只是 feedback 正文不同 —— 不另写 prompt,字段口径与首轮一致。
+- **用户主动改时把当前行程 JSON 一起喂进去**,并要求"做最小改动、没被要求改的部分保持原样"。不给的话模型会推倒重来:用户说"第 2 天换室内的",结果 5 天全变样,他前面认可的安排全没了。行程 JSON 过长时退化成文字摘要。
+- **`_feedback_for` 之前只管 issues**:Step 7 那条 prompt 的标题写死「上次生成未通过校验」,对"用户主动要求"语义不对(模型会以为自己在修 bug 而不是执行指令),改成中性的「这次必须落实的调整要求」。
+- **轮次上限只约束 critic 那圈自动重排**,用户主动改不受 `revision_round` 限制(他改几次是他的事)。
+
+验证结果:
+
+| 用例 | 结果 |
+|---|---|
+| 生成完说「第 2 天别安排户外,换成室内的」 | `intent=revise`、`['supervisor','reviser','critic']`、`status=generated`;day2 由「洱海生态廊道×2 + 喜洲古镇」换成「大理古城室内街区 + 五华楼」,**day1 原样保留** |
+| 再说「第 4 天减到 1 个景点」 | day4 由 3 个景点减到 1 个,其余天不动 —— "最小改动"这个要求在起作用 |
+| 还没有行程就要求改 | `intent=revise`、`status=collecting`、3.4s(不生成),回复「我得先有一份行程才能改。你先告诉我『从哪出发、去哪里、什么时候去、玩几天』…」 |
+| Java 落成一条新行程 | ⏳ 属全链路测试范围(前端→Java→Python),Step 9 之后统一验 |
+
+- **修掉两个只有这条路径才会暴露的 bug**:
+  1. **`status` 被兜底成 `collecting`**:用户主动改这条路是 `supervisor → reviser`,**没有 planner 走过**,而 `status` 一直是 planner 写的 —— 没人写就一路默认成 collecting,前端不会打开行程页。Step 7 那条没暴露是因为上游 planner 已经写过 `generated`,把问题盖住了。现由 reviser 自己写 `status/ready`。
+  2. **"没行程就想改"的话术是错的**:守卫按计划放在 supervisor,只能降级成 chitchat,而 chitchat 会顺着用户的话答「好的,第 2 天全安排室内」—— **像是答应了改一份并不存在的行程**。守卫挪进 `reviser_node`,由它回正确的话。
 
 ### Step 9 · 收尾
 - 天气影响安排:Planner 的 prompt 里,若 `state["weather"]` 有预报,按天注入(雨天提示室内、高温提示避开正午)
