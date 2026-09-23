@@ -4,25 +4,19 @@
   查什么(把"大理有什么好吃的"改写成"大理 美食 推荐"这种检索式)、
   用哪个工具(宽泛问题取整篇城市指南,具体问题做语义检索)、
   查几次(不够可以再查一轮)。
-
-为什么要自己写工具循环而不是用 ToolNode:ToolNode 需要一个带 messages 的子图,
-而本项目的图是扁平 dict 状态。循环很短(上限 MAX_TOOL_ROUNDS),自己写更好读。
+循环本身在 agents/base.tool_loop —— weather 是第二个消费者,所以放公共处。
 
 降级:渠道不支持 function calling → 卸掉工具直接答;工具报错 → 返回一句"没查到"
 让模型换个方式;LLM 挂 → 回复一句可读的失败原因,不抛异常。
 """
 from __future__ import annotations
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import SystemMessage
 
 from app.agents import base
 from app.graph.state import ChatState
 from app.llm import build_chat_llm
 from app.tools.rag_tool import RAG_TOOLS
-
-MAX_TOOL_ROUNDS = 2  # 允许"查 → 觉得不够再查"一轮,再多就是模型在打转
-
-_TOOLS_BY_NAME = {t.name: t for t in RAG_TOOLS}
 
 _SYS = (
     "你是旅行攻略专家,回答景点、美食、交通、玩法这类问题。"
@@ -31,35 +25,6 @@ _SYS = (
     "只依据查到的资料回答,绝不编造店名、价格、营业时间、门票;资料里没有的就直说没有。"
     "语气自然友好,回复简洁(通常不超过 150 字),别逐条罗列资料原文。"
 )
-
-
-def _run_tool(call: dict) -> str:
-    """执行模型请求的一次工具调用,任何失败都转成可读文本而不是异常。"""
-    name = str(call.get("name") or "")
-    tool = _TOOLS_BY_NAME.get(name)
-    if tool is None:
-        return f"（没有名为 {name} 的工具）"
-    try:
-        return str(tool.invoke(call.get("args") or {}))
-    except Exception as exc:
-        return f"（工具 {name} 调用失败:{type(exc).__name__}）"
-
-
-def _answer_with_tools(tool_llm, plain_llm, messages: list) -> str:
-    """工具循环:模型要工具就给结果,直到它给出正文;轮次用尽则卸掉工具强制作答。"""
-    convo = list(messages)
-    for _ in range(MAX_TOOL_ROUNDS):
-        ai = tool_llm.invoke(convo)
-        calls = list(getattr(ai, "tool_calls", None) or [])
-        if not calls:
-            return str(getattr(ai, "content", "") or "").strip()
-        convo.append(ai)
-        for call in calls:
-            convo.append(ToolMessage(content=_run_tool(call),
-                                     tool_call_id=str(call.get("id") or "")))
-    # 还在要工具:卸掉工具再问一次,强制它基于已有资料直接回答
-    convo.append(HumanMessage(content="请基于上面查到的资料直接给出回答,不要再调用工具。"))
-    return str(getattr(plain_llm.invoke(convo), "content", "") or "").strip()
 
 
 def retriever_node(state: ChatState) -> dict:
@@ -76,12 +41,7 @@ def retriever_node(state: ChatState) -> dict:
     messages += base.history_messages(state)
 
     try:
-        try:
-            tool_llm = llm.bind_tools(list(RAG_TOOLS))
-        except Exception:
-            tool_llm = None  # 渠道不支持 function calling:退化为直接答,至少不报错
-        reply = (_answer_with_tools(tool_llm, llm, messages) if tool_llm is not None
-                 else str(getattr(llm.invoke(messages), "content", "") or "").strip())
+        reply = base.tool_loop(llm, messages, RAG_TOOLS)
     except Exception as exc:
         reply = "回复生成超时/失败,请换个更短的说法再试。" if "Timeout" in type(exc).__name__ else \
             f"回复生成失败:{type(exc).__name__}:{exc}"
