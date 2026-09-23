@@ -16,6 +16,7 @@
 | Step 4 Budget 专家 | ✅ 已完成 (2026-09-22) | `agents/budget.py` 加 `budget_node` + `block_state`(护栏口径统一);接上 `budget` 分支 |
 | Step 5a Java 内部天气接口 | ✅ 已完成 (2026-09-23) | `InternalWeatherController` + `app.ai.service-key`。真 key 实测返回大理 4 天预报(0.51s) |
 | Step 5b Weather 专家 | ✅ 已完成 (2026-09-23) | `tools/weather_tool.py` + `agents/weather.py`;工具循环提到 `base.tool_loop`。**话术集 15/15,回复带真实预报且日期算对(今天/明天/后天)** |
+| 插队:Redis 可靠性修复 | ✅ 已完成 (2026-09-23) | 见下方"既有问题"第 2 条。Redis 挂时每轮 95s → ~2s,且停机期间对话不再丢 |
 | Step 6 ~ Step 9 | ⬜ 未开始 | |
 
 ### 实施中的偏离记录
@@ -30,7 +31,11 @@
 ### 已发现的既有问题(非本次改造引入,待处理)
 
 - ~~**Milvus 不可用时 `rag/retrieve.py:retrieve()` 空转 10.9 秒**~~ → **Step 3a 已修**(`_BREAKER` 熔断,`RAG_BREAKER_TTL_SECONDS` 默认 60s)。注意 TTL 到期后会再真试一次,所以 Milvus 长期挂掉时,每 60 秒仍会有一轮多等 11 秒;这是刻意的(不通就恢复),不是回归。
-- **Redis 挂掉时每轮对话白等约 95 秒**(未处理,**当前项目最影响体验的问题,建议优先单独排期**):`chat.py:_load_state`/`_save_state` 每次新建连接,`socket_connect_timeout=2` 只约束建立连接,不约束 redis-py 的重试退避。实测 Redis 停机时 load 47.1s + save 48.4s = 每轮 ~95s,而 LLM 本身只要 1s。Session 期间 Redis 进程死过一次,同一条消息从 3s 变成 101s,是这个原因、不是某一步改造引入。这与上面 Milvus 那条同源(依赖不可用时慢重试),同一套熔断/短路思路可解:加 `socket_timeout`、或连续失败后进"不可用"窗口直接走 `_MEM`。
+- ~~**Redis 挂掉时每轮对话白等约 95 秒**~~ → **已修 (2026-09-23)**。两个独立原因叠加:
+  1. **redis-py 8.x 默认带重试退避**:只设 `socket_connect_timeout` 时,连接失败会被重试并逐次拉长等待,实测停机时单次 op 要 27s。加 `retry=None` 后降到 ~1s。
+  2. **`localhost` 会先试 IPv6(::1) 再试 IPv4**:两次各等满一个 connect timeout,所以每次 op 的实际代价是"超时 × 2"。默认超时从 2s 降到 `REDIS_SOCKET_TIMEOUT_SECONDS=0.5`。
+  合起来:`_load_state`/`_save_state` 各一次读写 → 每轮 ~2s(原 ~95s)。client 也改为复用(原来每轮新建连接)。
+  顺带修掉一个**测出来的真 bug**:历史只存在 Redis 里,Redis 一挂「读不到 → 当成新会话」,**停机当轮就把对话清空了**(实测第 3 轮反过来问用户刚给过的出发地)。现加进程内镜像 `_STATE` + 脏标记 `_DIRTY`:写 Redis 失败就标脏,读时优先本地,Redis 恢复后下一轮自动写回并清标记。端到端复测:停机前 2 轮正常 → 停机后第 3/4 轮对话继续、params 不丢 → Redis 恢复后 `zhilv:chat:e2e-x` 里 10 条消息 + 完整 params 全在,回同步成功。
 - **验证环境提示**:probe 的耗时读数只有在 Redis、Milvus 都起来时才有意义;否则量到的是重试退避而不是业务耗时。
 - **`estimate_min_total` 冷启动约 26~30 秒**(既有行为,Step 4 暴露出来):模型对这条估算 prompt 会先输出一大段看不见的推理,再吐 18 个字符的 JSON(实测 25.7s 出 `{"min_total":1800}`)。按路线缓存 6h,所以**同一路线只慢第一次**,之后 0.00s。Step 4 之后 budget 路由在「回答够不够」时就会触发这个冷启动,比改造前(只在确认护栏时触发)更容易被用户撞上。可选修法:估算结果落 Redis 跨进程复用 / 换更快的估算方式 / 接受 6h 一次。**属设计取舍,留给用户定。**
 
