@@ -16,39 +16,23 @@ from __future__ import annotations
 import copy
 import json
 
-import redis as redis_lib
-
-from app.config import REDIS_HOST, REDIS_PORT, REDIS_SOCKET_TIMEOUT_SECONDS
 from app.graph.builder import GENERATE_GRAPH, GRAPH
+from app.redis_client import get_client
 
 _REDIS_PREFIX = "zhilv:chat:"
 
 
 # ---------------- Redis 状态存取 ----------------
-# 三个坑,都在这里处理:
-#   1) 每次新建连接没必要 —— 复用一个 client。
-#   2) redis-py 8.x 默认带重试退避:只设 socket_connect_timeout 时 Redis 停机单次 get 要等
-#      27 秒(实测),每轮 load+save 就是 ~50 秒。retry=None + 短超时后降到每次 ~1 秒。
-#   3) 历史只在 Redis 里的话,Redis 一挂**当轮就把对话清空**(读不到 → 当成新会话)。
-#      所以本地要留镜像 _STATE:读 Redis 失败时兜底用,对话不会断。
+# 连接本身的三个坑(复用、retry=None、短超时)已上移到 app/redis_client.py —— budget 也要连,
+# 出现第二个消费者才上移,这是本项目一贯的做法。这里只留本模块特有的降级逻辑:
+#   历史只在 Redis 里的话,Redis 一挂**当轮就把对话清空**(读不到 → 当成新会话)。
+#   所以本地要留镜像 _STATE:读 Redis 失败时兜底用,对话不会断。
 # _DIRTY 记"本地比 Redis 新"的 thread(那次写没成功),读的时候优先本地,
 # 免得 Redis 恢复后拿旧值把刚聊的内容盖掉;写成功就清标记,并自然完成回同步。
-_CLIENT: dict[str, redis_lib.Redis] = {}
 _STATE: dict[str, dict] = {}
 _DIRTY: set[str] = set()
 _STATE_MAX = 500  # 本地镜像条数上限(每条约几 KB),防长跑进程累积
 _DEFAULT_STATE = {"messages": [], "params": {}}
-
-
-def _client() -> redis_lib.Redis:
-    r = _CLIENT.get("r")
-    if r is None:
-        r = redis_lib.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True,
-                            socket_connect_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
-                            socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
-                            retry=None)
-        _CLIENT["r"] = r
-    return r
 
 
 def _remember(thread_id: str, state: dict) -> None:
@@ -65,7 +49,7 @@ def _load_state(thread_id: str) -> dict:
     if thread_id in _DIRTY:
         return copy.deepcopy(_STATE[thread_id])  # 本地比 Redis 新,别被 Redis 里的旧值盖掉
     try:
-        raw = _client().get(_REDIS_PREFIX + thread_id)
+        raw = get_client().get(_REDIS_PREFIX + thread_id)
         data = json.loads(raw) if raw else None
         if isinstance(data, dict):
             _remember(thread_id, data)
@@ -78,7 +62,7 @@ def _load_state(thread_id: str) -> dict:
 def _save_state(thread_id: str, state: dict) -> None:
     _remember(thread_id, state)  # 先记本地:写 Redis 失败也不丢这一轮
     try:
-        _client().set(_REDIS_PREFIX + thread_id, json.dumps(state, ensure_ascii=False))
+        get_client().set(_REDIS_PREFIX + thread_id, json.dumps(state, ensure_ascii=False))
     except Exception:
         _DIRTY.add(thread_id)  # 下次读优先本地,下一轮继续试着写回来
         return

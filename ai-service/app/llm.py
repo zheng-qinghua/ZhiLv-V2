@@ -76,15 +76,20 @@ def _cache_set(key: str, plan: TripPlan) -> None:
     _LLM_CACHE[key] = (time.time(), TripPlan(**plan.model_dump()))
 
 
-def build_chat_llm():
-    """创建 ChatOpenAI 实例;没配 API key 就返回 None。"""
+def build_chat_llm(temperature: float = 0.3):
+    """创建 ChatOpenAI 实例;没配 API key 就返回 None。
+
+    temperature 默认 0.3(会话类节点要一点措辞变化,不然每轮都像复读);
+    做分类/抽取的节点(supervisor)传 0 —— 它要的是同一句话每次判成同一个结果,
+    实测 0.3 时同一批话术连跑三次命中数会不同(15→14→13→12)。
+    """
     if not LLM_API_KEY:
         return None
     from langchain_openai import ChatOpenAI
 
     return ChatOpenAI(
         model=LLM_MODEL,
-        temperature=0.3,
+        temperature=temperature,
         api_key=LLM_API_KEY,
         base_url=LLM_BASE_URL or None,
         timeout=LLM_TIMEOUT_SECONDS,

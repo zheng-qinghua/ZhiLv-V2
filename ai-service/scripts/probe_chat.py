@@ -11,12 +11,18 @@
 
 输出格式: `[intent] status=... ready=... | 用户话 → 回复摘要`
 --suite 模式会在末尾给出分类命中率统计,便于判断 prompt 是否需要调。
+
+**--suite 每轮都用新的 run 标记**(默认取时间戳,可用 `--tag` 指定),跑完清掉自己造的会话。
+原因:`probe-suite-{i}` 这种固定会话 id 会跨轮次复用 Redis 里的历史 —— 第二轮的对话里
+已经躺着第一轮的问答,量出来的分歧就成了"历史不同"而不是"分类抖动",数字没法当回归基线。
+(实测踩过:同代码三轮 15→14→13→12,看起来像抖动,其实是会话在攒历史。)
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -86,15 +92,23 @@ def main() -> None:
     ap.add_argument("messages", nargs="*", help="要说的话,可多条(同一会话连续说)")
     ap.add_argument("--suite", action="store_true", help="跑内置话术集(每条独立会话)")
     ap.add_argument("--thread", default="probe", help="会话 id,同一 id 连续对话")
+    ap.add_argument("--tag", default="", help="suite 的 run 标记(默认时间戳),用来隔开各轮会话")
+    ap.add_argument("--keep", action="store_true", help="suite 跑完不清理会话(默认清理)")
     ap.add_argument("--url", default=DEFAULT_URL)
     args = ap.parse_args()
 
     if args.suite:
+        tag = args.tag or time.strftime("%m%d-%H%M%S")
+        threads = [f"probe-{tag}-{i}" for i in range(len(SUITE))]
         hit = 0
-        for i, (msg, expect) in enumerate(SUITE):
-            out = turn(args.url, f"probe-suite-{i}", msg)
-            hit += line(msg, out, expect)
-        print(f"\n分类命中 {hit}/{len(SUITE)}")
+        try:
+            for thread, (msg, expect) in zip(threads, SUITE):
+                out = turn(args.url, thread, msg)
+                hit += line(msg, out, expect)
+            print(f"\n分类命中 {hit}/{len(SUITE)}   (run={tag})")
+        finally:
+            if not args.keep:
+                _drop(args.url, threads)
         return
 
     if not args.messages:
@@ -102,6 +116,24 @@ def main() -> None:
 
     for msg in args.messages:
         line(msg, turn(args.url, args.thread, msg))
+
+
+def _drop(url: str, threads: list[str]) -> None:
+    """清掉本次 suite 造的会话。探针跑得勤,不清的话 Redis 里会攒一堆没人看的会话状态。
+
+    清不掉不算失败(Redis 没起时对话本来也走内存态),所以这里只提示不抛。
+    """
+    try:
+        from app.redis_client import get_client
+    except Exception as exc:  # 不在 ai-service 目录下跑时不致命
+        print(f"(跳过清理:{type(exc).__name__})")
+        return
+    try:
+        client = get_client()
+        keys = ["zhilv:chat:" + t for t in threads]
+        client.delete(*keys)
+    except Exception as exc:
+        print(f"(跳过清理:{type(exc).__name__})")
 
 
 if __name__ == "__main__":

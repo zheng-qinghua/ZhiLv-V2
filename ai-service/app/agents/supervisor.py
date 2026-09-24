@@ -22,6 +22,7 @@ intent 枚举(架构见 docs/MULTI_AGENT_PLAN.md):
 from __future__ import annotations
 
 import json
+from datetime import date
 
 from app.graph.params import PARAM_FIELDS, missing_params, resolved_days, resolved_travelers, route_sig
 from app.graph.state import ChatState
@@ -37,7 +38,8 @@ _SYS = (
     "只输出一个 JSON 对象,不要 markdown,不要解释。"
 )
 
-_HUMAN_TMPL = """当前已确定参数:{params}
+_HUMAN_TMPL = """今天是 {today}。
+当前已确定参数:{params}
 对话全文:
 {convo}
 
@@ -68,7 +70,11 @@ _HUMAN_TMPL = """当前已确定参数:{params}
 - insist_low_budget: 布尔。当且仅当用户本轮明确接受"预算不够也按最省/尽量压缩排期"继续(如"就按最省的安排吧""预算就这么点你看着办""越省越好"),才填 true;只是陈述自己预算低、或没表态,填 false
 
 注意:金额没说单位一律按总额 total;日期只认用户原话,别拿今天当默认;
-地点变了但用户没重说时间/人数等,就保留上文已确定的。直接给 JSON,不要 markdown,不要解释。"""
+地点变了但用户没重说时间/人数等,就保留上文已确定的。直接给 JSON,不要 markdown,不要解释。
+
+**月份日期没带年份时**(如"9月24号""1月5号"),补成**离今天最近的那个未来日期**,不要猜成过去的年份:
+今天是 {today} —— "9月24号"要补成 {this_year}-09-24;若这个月日今年已经过了(如今天 9 月、用户说"1月5号"),
+就补成 {next_year}-01-05。"明天/后天/下周一"这类相对说法同样按今天推算。"""
 
 
 def _build_prompt(params: dict, messages: list[dict]) -> str:
@@ -76,7 +82,16 @@ def _build_prompt(params: dict, messages: list[dict]) -> str:
         f"{'用户' if m.get('role') == 'user' else '助手'}: {m.get('content', '')}"
         for m in messages
     )
-    return _HUMAN_TMPL.format(params=json.dumps(params, ensure_ascii=False), convo=convo)
+    # 今天必须给模型:用户常只说"9月24号",不给年份参照它就会猜(实测猜成了去年的 2025-09-24,
+    # 行程整个排到过去,天气注入也跟着失效)。
+    today = date.today()
+    return _HUMAN_TMPL.format(
+        params=json.dumps(params, ensure_ascii=False),
+        convo=convo,
+        today=today.isoformat(),
+        this_year=today.year,
+        next_year=today.year + 1,
+    )
 
 
 def _merge_params(params: dict, obj: dict) -> dict:
@@ -116,7 +131,9 @@ def supervisor_node(state: ChatState) -> dict:
     trace = list(state.get("agent_trace") or []) + ["supervisor"]
     out: dict = {"params": params, "intent": "collect", "agent_trace": trace}
 
-    llm = build_chat_llm()
+    # temperature=0:这个节点只做分类和抽取,要的是"同一句话每次判成同一个结果"。
+    # 0.3 时同一批话术连跑三次命中数会不同(15→14→13→12),意图准确率就不是可复现的数字了。
+    llm = build_chat_llm(temperature=0.0)
     if llm is None:
         return out
 

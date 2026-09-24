@@ -19,17 +19,57 @@ from app.agents import base
 from app.graph.params import budget_total_of, resolved_days, resolved_travelers, route_sig
 from app.graph.state import ChatState
 from app.llm import _extract_json_object, build_chat_llm
+from app.redis_client import get_client
 
 _MIN_TTL_SECONDS = 6 * 3600  # 最低花费按路线缓存 6h,跨会话复用
+_MIN_REDIS_PREFIX = "zhilv:mincost:"
 _MIN_CACHE: dict[str, tuple[float, float]] = {}  # sig -> (存入时间, 最低总花费)
+
+
+def _cached_min_total(sig: str) -> float | None:
+    """取缓存:先进程内(免费),再 Redis(跨重启/多进程),都没有返回 None。
+
+    为什么要落 Redis:这条估算冷启动要 26~48s(模型先吐一大段看不见的推理)。
+    只缓在进程内的话,每次重启/发版,凡是用户新问到的路线都要再等一次 ——
+    估算结果只取决于路线,是完全可以跨进程复用的。
+    """
+    item = _MIN_CACHE.get(sig)
+    if item and time.time() - item[0] < _MIN_TTL_SECONDS:
+        return item[1]
+    try:
+        raw = get_client().get(_MIN_REDIS_PREFIX + sig)
+        data = json.loads(raw) if raw else None
+    except Exception:
+        return None  # Redis 挂了只损失"跨重启复用",本次问答照常
+    if not isinstance(data, dict):
+        return None
+    try:
+        saved, v = float(data["t"]), float(data["v"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if 0 < v < 10_000_000 and time.time() - saved < _MIN_TTL_SECONDS:
+        _MIN_CACHE[sig] = (saved, v)  # 回填进程内,同进程后续不再走 Redis
+        return v
+    return None
+
+
+def _store_min_total(sig: str, v: float) -> None:
+    now = time.time()
+    _MIN_CACHE[sig] = (now, v)
+    try:
+        # TTL 交给 Redis;同时存写入时间,回填进程内后两边的过期口径才一致
+        get_client().setex(_MIN_REDIS_PREFIX + sig, _MIN_TTL_SECONDS,
+                           json.dumps({"t": now, "v": v}))
+    except Exception:
+        pass  # 写不进去只是下次还得重估,不影响本次结果
 
 
 def estimate_min_total(dep: str, dest: str, day_count: int, travelers: int) -> float | None:
     """DeepSeek 估"最省也现实可行"的总花费(含往返大交通);失败返回 None = 不拦截。"""
     sig = route_sig(dep, dest, day_count, travelers)
-    item = _MIN_CACHE.get(sig)
-    if item and time.time() - item[0] < _MIN_TTL_SECONDS:
-        return item[1]
+    hit = _cached_min_total(sig)
+    if hit is not None:
+        return hit
     llm = build_chat_llm()
     if llm is None:
         return None
@@ -41,11 +81,11 @@ def estimate_min_total(dep: str, dest: str, day_count: int, travelers: int) -> f
     )
     try:
         resp = llm.invoke([("system", "你是旅行成本估算器,只回答数字,不解释。"), ("human", prompt)])
-        frag = _extract_json_object(str(getattr(resp, "content", "")))
+        frag = _extract_json_object(str(getattr(resp, "content", "") or ""))
         if frag:
             v = float(json.loads(frag).get("min_total"))
             if 0 < v < 10_000_000:
-                _MIN_CACHE[sig] = (time.time(), v)
+                _store_min_total(sig, v)
                 return v
     except Exception:
         pass  # 估算失败不缓存、不拦截,避免打断对话
