@@ -15,9 +15,11 @@ load_dotenv(BASE_DIR / ".env")
 SERVICE_PORT = int(os.getenv("SERVICE_PORT", "8100"))
 
 # ---- Java 后端(weather Agent 回调用;/internal/** 用共享密钥校验)----
-# 默认值与 backend 的 app.ai.service-key 默认值一致,本地零配置可跑;生产两边都要覆盖
+# AI_SERVICE_KEY 不给默认值:本文件会进公开仓库,写死等于把共享密钥公开。
+# 必须由 ai-service/.env(或环境变量)提供,且与后端 app.ai.service-key 完全一致。
+# 两边都没配时,后端 /internal/weather 会回 500「内部接口未配置共享密钥:后端缺 AI_SERVICE_KEY。」
 JAVA_BASE_URL = os.getenv("JAVA_BASE_URL", "http://localhost:8080")
-AI_SERVICE_KEY = os.getenv("AI_SERVICE_KEY", "zhilv-internal-dev-key")
+AI_SERVICE_KEY = os.getenv("AI_SERVICE_KEY", "")
 
 # ---- Redis(对话状态持久化,native JSON,本机 6379 无密码)----
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")

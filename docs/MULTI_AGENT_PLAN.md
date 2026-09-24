@@ -45,11 +45,24 @@
   2. **`localhost` 会先试 IPv6(::1) 再试 IPv4**:两次各等满一个 connect timeout,所以每次 op 的实际代价是"超时 × 2"。默认超时从 2s 降到 `REDIS_SOCKET_TIMEOUT_SECONDS=0.5`。
   合起来:`_load_state`/`_save_state` 各一次读写 → 每轮 ~2s(原 ~95s)。client 也改为复用(原来每轮新建连接)。
   顺带修掉一个**测出来的真 bug**:历史只存在 Redis 里,Redis 一挂「读不到 → 当成新会话」,**停机当轮就把对话清空了**(实测第 3 轮反过来问用户刚给过的出发地)。现加进程内镜像 `_STATE` + 脏标记 `_DIRTY`:写 Redis 失败就标脏,读时优先本地,Redis 恢复后下一轮自动写回并清标记。端到端复测:停机前 2 轮正常 → 停机后第 3/4 轮对话继续、params 不丢 → Redis 恢复后 `zhilv:chat:e2e-x` 里 10 条消息 + 完整 params 全在,回同步成功。
-- **话术集命中率本身是抖的(12~15/15),别把单次 15/15 当成回归基线**:Step 7 改完复测,同代码连跑三次得到 15→14→13→12 中不同的组合,**每次挂的话术都不一样**。原因在 `supervisor_node` 那次 LLM 分类(`temperature=0.3`),不在路由代码 —— 已用 git 确认 `supervisor.py` / `graph/params.py` 在 Step 6/7 全程未被改动。
-  最常挂的两条是「就按最省的安排吧」「帮我生成行程吧」(在没有任何参数时)。注意 `_apply_guards` 会把"没有行程时的 `revise`"降级成 `chitchat`,所以模型把「按最省的安排」读成"改行程"时会落到 chitchat,而 probe 期望 `collect` —— 这条期望值本身也偏严。
-  想稳住的话有两条路(都未做,留用户定):给 supervisor 单独降到 `temperature=0`;或把 probe 的话术期望改宽(plan/revise/collect 在无参数时都算过)。
+- ~~**话术集命中率本身是抖的(12~15/15)**~~ → **已定位:不是抖动,是 probe 自己的会话在攒历史 (2026-09-23)**。
+  原先 `--suite` 用固定的 `probe-suite-{i}` 当会话 id,而会话状态存在 Redis 里且没有 TTL ——
+  **同一轮话术跑第二次时,对话里已经躺着第一次的问答**。所以三轮 15→14→13→12 的分歧,
+  量的是"三轮看到的历史不同",不是"分类随机性"。同样的原因还让回复显示出假的缺陷:
+  会话里攒了几轮之后就出现「无参数却编了一份成都 4 天行程」,干净会话下并不复现(正确回复是追问缺的信息)。
+  修法:每轮 suite 用新的 run 标记(`probe-<时间戳>-<i>`),跑完删掉自己造的键(`--keep` 可保留)。
+  **修正后的实测(干净会话,同代码连跑三轮)= 14/15、15/15、14/15**。
+  唯一不稳的那条是「帮我生成行程吧」(无参数时判成 `chitchat` 而不是 `collect`)——
+  但 `ROUTES` 里 `collect` 和 `chitchat` **指向同一个节点**,所以这是标签口径之争、不是行为差异,
+  用户可见的回复完全一样。probe 现在仍按 `collect` 计,统计时要把这条单独说明。
+  顺带把 supervisor 的 `temperature` 降到 0(分类/抽取本就该用 0;会话类节点仍保持 0.3
+  以免每轮措辞像复读)。**注意:改善主要来自修好 probe,不是来自降温** —— 上面那个归属
+  原先写错了,特此更正。
 - **验证环境提示**:probe 的耗时读数只有在 Redis、Milvus 都起来时才有意义;否则量到的是重试退避而不是业务耗时。
-- **`estimate_min_total` 冷启动约 26~30 秒**(既有行为,Step 4 暴露出来):模型对这条估算 prompt 会先输出一大段看不见的推理,再吐 18 个字符的 JSON(实测 25.7s 出 `{"min_total":1800}`)。按路线缓存 6h,所以**同一路线只慢第一次**,之后 0.00s。Step 4 之后 budget 路由在「回答够不够」时就会触发这个冷启动,比改造前(只在确认护栏时触发)更容易被用户撞上。可选修法:估算结果落 Redis 跨进程复用 / 换更快的估算方式 / 接受 6h 一次。**属设计取舍,留给用户定。**
+- ~~**`estimate_min_total` 冷启动约 26~30 秒**~~ → **已修 (2026-09-23)**:估算结果原来只缓在**进程内**(`_MIN_CACHE`,按路线 6h),所以每次重启/发版,凡是用户新问到的路线都要再等一次(实测冷启动 21.9s,最长到过 48s —— 预算护栏在「确认」和「回答够不够」两条路上都会被触发,撞上的概率不低)。
+  修法:落 Redis(`zhilv:mincost:<路线签名>`,TTL 6h,与进程内缓存同口径)。Redis 挂了只是失去"跨重启复用",本次问答照常,不拦截。
+  为此把 Redis 连接层从 `chat.py` 上移到新的 `app/redis_client.py` —— **budget 成了第二个消费者**(本项目一贯的"第二个消费者出现才上移")。连接参数(复用 client、`retry=None`、0.5s 短超时)原样保留,`chat.py` 只留自己的本地镜像降级逻辑。
+  验证:**同进程清掉进程内缓存 → 0.000s 命中 Redis;全新进程 → 0.008s 命中**(冷启动 21.9s)。
 
 ---
 
@@ -220,13 +233,13 @@ ai-service/app/
 
 **5a · Java 内部天气接口 ✅ 已完成**
 - 后端新建 `InternalWeatherController`(`GET /internal/weather?city=`,校验 `X-AI-Service-Key`,不要求登录)
-- 后端改 `application.properties`:`app.ai.service-key=${AI_SERVICE_KEY:zhilv-internal-dev-key}`
+- 后端改 `application.properties`:`app.ai.service-key=${AI_SERVICE_KEY:}`(值一律由环境变量给)
 - 注意:`/internal/**` 不在 `/api/**` 下,`SecurityConfig` 的 `anyRequest().permitAll()` 已放行,鉴权在 Controller 内做
 
 实际做法与验证:
 - **没动 `SecurityConfig`**:`/internal/weather` 落进 `anyRequest().permitAll()`,校验改由 Controller 自己做(放行≠不鉴权,只是换鉴权方式)。已在 Controller 注释里写明。
 - **复用了现有的 `AmapWeatherService`**:它已经能"城市名 → adcode → 逐日预报",内部接口只是薄薄一层转发 + 换鉴权,没重写高德调用。
-- **共享密钥给了开发默认值**(与 `app.jwt.secret` 同款):本地零配置可跑,生产必须用 `AI_SERVICE_KEY` 覆盖。Python 侧将用同名默认值,两边不配也能对上。
+- ~~共享密钥给了开发默认值(与 `app.jwt.secret` 同款)~~:该默认值已在「上传前清密钥」中删除 —— 仓库要公开,写死的默认值等于把密钥公开。现在两边都只从环境变量读 `AI_SERVICE_KEY`,必须配成同一个值。
 - 验证(后端带真实 `AMAP_API_KEY` 启动,key 只作进程环境变量,未落任何文件):
 
 | 用例 | 结果 |
@@ -434,3 +447,35 @@ ai-service/app/
 - LangGraph checkpointer(D27;现在仍是 native JSON 存 Redis,够用)
 - 专家级别的独立模型/独立温度配置(等有实测收益再说)
 - 并行 fan-out(如 Retriever + Weather 同时跑)——收益不足以抵消复杂度
+
+## 11. 上传前清密钥(2026-09-24)
+
+仓库要推到公开 GitHub,`application.properties` / `config.py` 会一起进仓库,所以**代码里的密钥默认值一律删掉**,改由环境变量注入。
+
+| 位置 | 改前 | 改后 |
+|---|---|---|
+| `application.properties` | 三项都带开发默认值(数据库口令、JWT 密钥、内部服务密钥) | 三项默认值全空 |
+| `JwtUtil.init()` | 无校验,jjwt 到签名时才抛 `signing key's size is 0 bits` | 空值即抛可读异常,点名 `JWT_SECRET` 和 `setx` 步骤 |
+| `ai-service/app/config.py` | `AI_SERVICE_KEY` 有同名开发默认值 | 默认值删掉,只从 `.env`/环境变量读 |
+| `一键启动.bat` | 直接起服务 | 先检查三个变量,缺了就打印缺失项 + `setx` 命令并停住 |
+| `ai-service/.env.example` | 只有 LLM / Redis 几项 | 补 `AI_SERVICE_KEY`、`EMBEDDING_*`、`MYSQL_*`、`RAG_*` 空占位 |
+
+本地要跑起来需先设(值自定,`AI_SERVICE_KEY` 两边必须一致):
+
+```
+setx JWT_SECRET "your-32-chars-or-longer-secret"
+setx AI_SERVICE_KEY "your-shared-internal-key"
+setx DB_PASSWORD "your-mysql-password"
+```
+
+改完的启动验证(三个变量按上表注入进程环境):
+
+| 用例 | 结果 |
+|---|---|
+| 不带 `JWT_SECRET` 启动 | 立即失败,栈顶 `IllegalStateException: 缺少 JWT_SECRET:...(>=32 字符)…setx JWT_SECRET`,不再是 jjwt 那句看不懂的报错 |
+| 带三个变量启动 | `Started ZhilvApplication in 3.9s` |
+| `POST /api/auth/login`(demo_d20_01) | 200,拿到 HS384 token |
+| `/internal/weather?city=大理` 带正确 key | 200,真实预报 4 天 |
+| 同上、key 不对 | 401 `内部接口校验失败` |
+
+`AMAP_API_KEY` 不在这三个必需项里:没配时天气分支会回可读提示,不阻断启动。

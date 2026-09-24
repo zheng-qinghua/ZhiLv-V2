@@ -15,6 +15,23 @@ echo   Ports already running are auto-skipped. Safe to rerun.
 echo ==============================================
 echo.
 
+rem ---------- Required secrets: the repo no longer ships default values ----------
+set "MISSING="
+if "%JWT_SECRET%"=="" set "MISSING=%MISSING% JWT_SECRET"
+if "%AI_SERVICE_KEY%"=="" set "MISSING=%MISSING% AI_SERVICE_KEY"
+if "%DB_PASSWORD%"=="" set "MISSING=%MISSING% DB_PASSWORD"
+if not "%MISSING%"=="" (
+  echo [x] Missing environment variables:%MISSING%
+  echo     application.properties no longer carries default secrets. Set them once, then reopen this window:
+  echo       setx JWT_SECRET "your-32-chars-or-longer-secret"
+  echo       setx AI_SERVICE_KEY "your-shared-internal-key"
+  echo       setx DB_PASSWORD "your-mysql-password"
+  echo     AI_SERVICE_KEY must equal AI_SERVICE_KEY in ai-service\.env.
+  goto end_fail
+)
+echo [ok] env     JWT_SECRET / AI_SERVICE_KEY / DB_PASSWORD present
+if "%AMAP_API_KEY%"=="" echo [..] AMAP_API_KEY empty - weather questions will answer with a "not configured" note
+
 rem ---------- MySQL (expected to run as a Windows service) ----------
 netstat -ano | findstr /C:":3306 " >nul 2>&1
 if errorlevel 1 (
