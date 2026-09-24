@@ -28,6 +28,14 @@ public class JwtUtil {
 
     @PostConstruct
     void init() {
+        // 密钥不能再有"开发默认值":application.properties 会进公开仓库,写死等于公开。
+        // 没配时必须在这里拦住并把话说明白 —— 否则 jjwt 只在真正签名时才抛
+        // "The signing key's size is 0 bits",看不出是环境变量没给。
+        if (secret == null || secret.isBlank()) {
+            throw new IllegalStateException(
+                    "缺少 JWT_SECRET:JWT 签名密钥必须由环境变量提供(>=32 字符)。"
+                            + "本地运行前先执行 setx JWT_SECRET \"你的密钥\",然后重开终端再启动。");
+        }
         this.key = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
     }
 
