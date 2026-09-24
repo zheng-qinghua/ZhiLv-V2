@@ -1,7 +1,0 @@
-专家 Agent,职责,对应现有代码
-Planner 行程规划,生成逐日行程,蓝：llm.py generate_trip_plan 扩展
-Budget 预算评估,最低花费 / 预算护栏,蓝：chat.py _estimate_min_total 独立成节点
-Retriever 攻略检索,RAG 召回,蓝：rag/retrieve.py 包装成工具（function calling）
-Weather 天气,实时天气影响安排,紫：新增，接 AmapWeatherService
-Critic 评审,挑错 / 修订,紫：新增
-Reviser 改行程,生成后局部修改,紫：新增
