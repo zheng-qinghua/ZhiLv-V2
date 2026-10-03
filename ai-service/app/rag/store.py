@@ -12,6 +12,7 @@ from app.config import (
     MYSQL_PASSWORD,
     MYSQL_PORT,
     MYSQL_USER,
+    RAG_MILVUS_TIMEOUT_SECONDS,
     RAG_MILVUS_URI,
 )
 
@@ -123,7 +124,9 @@ _milvus: MilvusClient | None = None
 def milvus_client() -> MilvusClient:
     global _milvus
     if _milvus is None:
-        _milvus = MilvusClient(uri=RAG_MILVUS_URI)
+        # timeout 一定要给:默认 None = 无限等,Milvus 停掉时请求会挂死而不是报错,
+        # 熔断逻辑(见 rag/retrieve.py)就永远等不到失败。
+        _milvus = MilvusClient(uri=RAG_MILVUS_URI, timeout=RAG_MILVUS_TIMEOUT_SECONDS)
     return _milvus
 
 

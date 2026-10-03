@@ -62,5 +62,11 @@ if not RAG_DATA_DIR.is_absolute():
     RAG_DATA_DIR = BASE_DIR / RAG_DATA_DIR
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))  # bge-m3 固定 1024
-# Milvus 不可用时每次召回要等 pymilvus 重试约 10 秒才降级;连续失败后短路这么久再试一次
+# Milvus 不可用时每次召回要先等一次失败(端口被拒约 10s,超时则是 RAG_MILVUS_TIMEOUT_SECONDS);
+# 连续失败后短路这么久再试一次
 RAG_BREAKER_TTL_SECONDS = float(os.getenv("RAG_BREAKER_TTL_SECONDS", "60"))
+# Milvus 每次调用的超时。**必须设**:不设的话 pymilvus 默认无限等,而 Docker 的端口代理在
+# 容器停掉后仍占着宿主监听口 —— TCP 连得上但 RPC 永不返回,请求会挂死(实测 >120s),
+# 熔断连"失败"都等不到,压根不触发。设了超时才退化成"5 秒后失败 → 熔断接管"。
+# 正常搜索本地只要几十毫秒,5 秒是给建索引/load_collection 留的余量。
+RAG_MILVUS_TIMEOUT_SECONDS = float(os.getenv("RAG_MILVUS_TIMEOUT_SECONDS", "5"))

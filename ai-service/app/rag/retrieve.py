@@ -1,9 +1,14 @@
 """召回:query 嵌入 → Milvus 取 chunk_id → MySQL 取原文。任一端不可用都静默降级为空列表,
 对话照常走(不带知识库),不让 RAG 故障打断主流程。
 
-熔断:Milvus 挂掉时 pymilvus 每次都要重试约 10 秒才抛异常。若不做处理,每轮对话都白等
-这 10 秒(连嵌入的 1 秒也白花)。所以检测到连续失败后,在 RAG_BREAKER_TTL_SECONDS 内
-直接返回空,不再发起请求;TTL 过期后再真试一次,通了就恢复。"""
+熔断:Milvus 挂掉时每次召回都要白等一次超时才降级(连嵌入那一步也白花)。若不做处理,
+每轮对话都吃这个亏。所以检测到连续失败后,在 RAG_BREAKER_TTL_SECONDS 内直接返回空,
+不再发起请求;TTL 过期后再真试一次,通了就恢复。
+
+"等一次超时"到底多久,取决于 Milvus 怎么没的:端口从没起过 → 连接被拒,pymilvus 重试
+约 10 秒放弃;起过又被停掉 → Docker 端口代理仍占着宿主口,TCP 连得上但 RPC 不返回,
+**不设 timeout 就一直挂**。所以 store.milvus_client() 显式传了 RAG_MILVUS_TIMEOUT_SECONDS,
+把这条路径统一压到几秒内失败,熔断才有机会接管。"""
 from __future__ import annotations
 
 import time
